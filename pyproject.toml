@@ -1,0 +1,20 @@
+[project]
+name = "zhegutian-eval"
+version = "0.1.0"
+description = "鹧鸪天评测集"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.13.3",
+    "pypinyin>=0.55.0",
+    "tabulate>=0.10.0",
+]
+
+[project.scripts]
+zhegutian = "main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

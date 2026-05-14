@@ -1,0 +1,126 @@
+{
+  "cipai": "鹧鸪天",
+  "variant": "正体（晏几道体）",
+  "total_chars": 55,
+  "source": "《钦定词谱》卷十",
+  "rhyme_book": "现代拼音（中华新韵十八韵）",
+  "symbol_def": {
+    "平": "现代汉语一声（阴平）、二声（阳平）",
+    "仄": "现代汉语三声（上声）、四声（去声）",
+    "中": "可平可仄，评分时跳过"
+  },
+  "stanzas": [
+    {
+      "section": "上阕",
+      "lines": [
+        {
+          "index": 1,
+          "char_count": 7,
+          "text_tpl": "中仄平平中仄平",
+          "rhyme": true,
+          "rhyme_role": "起韵",
+          "strict_positions": [2, 4, 6],
+          "tail_strict_pingze": true,
+          "tail_rhyme": true
+        },
+        {
+          "index": 2,
+          "char_count": 7,
+          "text_tpl": "中平中仄仄平平",
+          "rhyme": true,
+          "strict_positions": [2, 4, 6],
+          "tail_strict_pingze": true,
+          "tail_rhyme": true
+        },
+        {
+          "index": 3,
+          "char_count": 7,
+          "text_tpl": "中平中仄平平仄",
+          "rhyme": false,
+          "strict_positions": [2, 4, 6],
+          "tail_strict_pingze": true,
+          "tail_rhyme": false
+        },
+        {
+          "index": 4,
+          "char_count": 7,
+          "text_tpl": "中仄平平中仄平",
+          "rhyme": true,
+          "strict_positions": [2, 4, 6],
+          "tail_strict_pingze": true,
+          "tail_rhyme": true
+        }
+      ]
+    },
+    {
+      "section": "下阕",
+      "lines": [
+        {
+          "index": 5,
+          "char_count": 3,
+          "text_tpl": "平仄仄",
+          "rhyme": false,
+          "strict_positions": [1, 2, 3],
+          "tail_strict_pingze": true,
+          "tail_rhyme": false
+        },
+        {
+          "index": 6,
+          "char_count": 3,
+          "text_tpl": "仄平平",
+          "rhyme": true,
+          "strict_positions": [1, 2, 3],
+          "tail_strict_pingze": true,
+          "tail_rhyme": true
+        },
+        {
+          "index": 7,
+          "char_count": 7,
+          "text_tpl": "中平中仄仄平平",
+          "rhyme": true,
+          "strict_positions": [2, 4, 6],
+          "tail_strict_pingze": true,
+          "tail_rhyme": true
+        },
+        {
+          "index": 8,
+          "char_count": 7,
+          "text_tpl": "中平中仄平平仄",
+          "rhyme": false,
+          "strict_positions": [2, 4, 6],
+          "tail_strict_pingze": true,
+          "tail_rhyme": false
+        },
+        {
+          "index": 9,
+          "char_count": 7,
+          "text_tpl": "中仄平平中仄平",
+          "rhyme": true,
+          "strict_positions": [2, 4, 6],
+          "tail_strict_pingze": true,
+          "tail_rhyme": true
+        }
+      ]
+    }
+  ],
+  "special_rules": {
+    "antithesis": {
+      "required": [
+        {
+          "pair": [3, 4],
+          "desc": "上阕第三、四句必对仗",
+          "type": "strict",
+          "weight": 1.0
+        }
+      ],
+      "recommended": [
+        {
+          "pair": [5, 6],
+          "desc": "下阕三字句宜对偶",
+          "type": "soft",
+          "weight": 0.5
+        }
+      ]
+    }
+  }
+}
