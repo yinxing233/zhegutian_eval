@@ -32,9 +32,13 @@ plans/
 
 # 数据与评估产物
 # 如果你的 data/ 文件夹内包含不希望上传的大型数据集或生成的 jsonl，建议取消下一行注释
-# data/*.jsonl
+data/*.jsonl
+runs/
+
 *.log
+run_archive
 eval_results.json
+generated_results.jsonl
 
 # =================================================================
 # 4. 编辑器与操作系统 (个人偏好文件)
