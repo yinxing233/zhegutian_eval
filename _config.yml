@@ -1,0 +1,4 @@
+# 选择一个极简主题，Cayman 或 Architect 都很干净
+theme: jekyll-theme-cayman
+title: "鹧鸪天 · 大模型失败模式观测器"
+description: "结构化失败观测与可复现评测系统"

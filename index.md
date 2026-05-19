@@ -25,11 +25,12 @@
 
 ## 快速导航
 
-- [📖 项目总览与快速开始](./README.md)
-- [💡 设计哲学](./docs/philosophy.md) – 为何这样定义评测
-- [🏗️ 系统工程与架构](./docs/architecture.md)
-- [🔬 方法论](./docs/methodology.md)
-- [🦠 坏案例集](./docs/bad_cases.md) – 最珍贵的观测窗口
+- [📖 项目总览与快速开始](https://github.com/yinxing233/zhegutian_eval)
+- [💡 设计哲学](./docs/philosophy/philosophy.md) – 为何这样定义评测
+- [🏗️ 系统工程与架构](./docs/architecture/architecture.md)
+- [🗂️ 项目骨架](./docs/engineering/PROJECT_MAP.md)
+- [📚 概念定义](./docs/philosophy/concepts.md)
+- [⌚️ 未来方向](./docs/bad_cases.md)
 
 ---
 
