@@ -223,12 +223,18 @@ def main():
             round(total_score / available_score * 100, 2) if available_score > 0 else 0
         )
 
-        error_category = Evaluator.infer_instability_pattern(
-            metrics, ci_text, finish_reason
+        # 传入 reasoning_content 诊断 reasoning_overflow
+        reasoning_content = record.get("reasoning_content")
+        error_tags_raw = Evaluator.infer_instability_pattern(
+            metrics, ci_text, finish_reason, reasoning_content
         )
+        error_category = [tag["symptom"] for tag in error_tags_raw]
 
         # 追加生成截断标记
-        if finish_reason == "MAX_TOKENS":
+        if (
+            finish_reason == "MAX_TOKENS"
+            and "generation_truncated" not in error_category
+        ):
             error_category = ["generation_truncated"] + [
                 t for t in error_category if t != "generation_truncated"
             ]
@@ -270,9 +276,11 @@ def main():
             "available_score": available_score,
             "normalized_score": normalized_score,
             "error_category": error_category,
+            "instability_tags": error_tags_raw,  # ← 新增结构化标签
             "badcase": is_badcase,
             "badcase_reason": badcase_reason,
             "semantic_raw": semantic_result.get("raw", "")[:500],
+            "failure_trace": eval_result.get("failure_trace", []),
         }
         results.append(snapshot)
 

@@ -29,7 +29,22 @@ def check_antithesis(
     line_a: str, line_b: str, rule_antithesis: Optional[Mapping[str, Any]] = None
 ) -> Dict[str, Any]:
     client = LLMClient()
+
+    # 动态组装对仗约束要求，使 LLM 裁判能够感知具体的对仗约束要求
+    extra_instructions = ""
+    if rule_antithesis:
+        # 提取对仗规则中的描述或类型等信息
+        desc = rule_antithesis.get("desc")
+        rule_type = rule_antithesis.get("type")
+        if desc:
+            extra_instructions += f"\n特殊对仗要求描述：{desc}"
+        if rule_type:
+            extra_instructions += f"\n对仗强度要求：{rule_type}（strict表示必须极其工整，soft/recommended表示推荐工整）"
+
     prompt = ANTITHESIS_PROMPT.format(line_a=line_a, line_b=line_b)
+    if extra_instructions:
+        prompt += f"\n请额外注意以下规则约束：{extra_instructions}\n"
+
     result = client.ask_json(prompt)
 
     if "error" in result:

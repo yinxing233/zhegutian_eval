@@ -1,10 +1,6 @@
-# src/evaluator.py
 """
 评测调度层
 负责加载规则、预处理文本、调用各 metrics 并汇总评分结果。
-v0.2 更新：
-- evaluate() 支持 constraints 参数，进行韵部限定检查和必含词检查
-- 新增静态方法 infer_instability_pattern() 用于自动失稳模式推断
 """
 
 import dataclasses
@@ -178,6 +174,54 @@ class Evaluator:
         else:
             semantic_evaluated = True
 
+        # 9. 收集 failure_trace (时序崩塌追踪)
+        failure_trace = []
+
+        # 9.1 结构不完整
+        if not structure_ok:
+            failure_trace.append(
+                {
+                    "step": len(failure_trace) + 1,
+                    "type": "structure_incomplete",
+                    "detail": f"期望句数 {expected_count}，实际句数 {actual_count}",
+                }
+            )
+
+        # 9.2 逐句平仄错误
+        for r in pingze_results:
+            if r.get("error_positions"):
+                failure_trace.append(
+                    {
+                        "step": len(failure_trace) + 1,
+                        "line": r["sentence_index"],
+                        "type": "pingze_fail",
+                        "detail": f"第 {r['sentence_index']} 句平仄不符，出错位置：{r['error_positions']}",
+                    }
+                )
+
+        # 9.3 押韵错误
+        if not rhyme_result.get("rhyme_ok"):
+            failure_trace.append(
+                {
+                    "step": len(failure_trace) + 1,
+                    "type": "rhyme_fail",
+                    "detail": rhyme_result.get("detail", "押韵失败"),
+                }
+            )
+
+        # 9.4 对仗错误
+        for r in antithesis_results:
+            if r.get("score", 1.0) < 0.8:  # 设定对仗不工整阈值
+                pair = r.get("sentence_pair", [])
+                failure_trace.append(
+                    {
+                        "step": len(failure_trace) + 1,
+                        "lines": pair,
+                        "type": "antithesis_fail",
+                        "detail": f"第 {pair} 句对仗不工整，得分：{r.get('score')}, 详情：{r.get('detail')}",
+                    }
+                )
+
         return {
             "structure_ok": structure_ok,
             "expected_lines": expected_count,
@@ -189,6 +233,7 @@ class Evaluator:
             "semantic_evaluated": semantic_evaluated,
             "semantic_missing_reason": semantic_missing_reason,
             "overall": overall,
+            "failure_trace": failure_trace,
         }
 
     @staticmethod
@@ -196,57 +241,85 @@ class Evaluator:
         metrics: Dict[str, float],
         generated: str = "",
         finish_reason: str = "",
-    ) -> List[str]:
+        reasoning_content: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
         """
         根据各维度得分和生成状态，推断失稳模式标签。
-        :param metrics: 各维度得分字典，必须包含 structure, pingze, rhyme, antithesis, semantic
-        :param generated: 生成文本
-        :param finish_reason: 生成终止原因
-        :return: 失稳标签列表
+        返回冻结版 taxonomy：每个元素为 {"symptom": str, "primary_field": str}
+        primary_field 取值：M_ONLY, F_imagery, F_emotional, NONE（永不缺失）
         """
-        tags = []
+        tags: List[Dict[str, str]] = []
 
-        # 表层症状（M层）
+        # ---------- 1. 纯 M 层症状（primary_field = "M_ONLY"） ----------
+
+        # reasoning_overflow：推理链过长
+        if finish_reason in ("length", "MAX_TOKENS") and reasoning_content:
+            gen_len = len(generated) if generated else 0
+            if len(reasoning_content) > max(100, gen_len * 2):
+                tags.append(
+                    {"symptom": "reasoning_overflow", "primary_field": "M_ONLY"}
+                )
+
+        # empty_output：完全空输出（优先级最高，直接返回）
         if not generated or len(generated.strip()) == 0:
-            tags.append("empty_output")
-            tags.append("constraint_overload")
+            tags.append({"symptom": "empty_output", "primary_field": "M_ONLY"})
             return tags
 
+        # truncated：输出被截断
         if finish_reason == "length" and len(generated) < 40:
-            tags.append("truncated")
+            tags.append({"symptom": "truncated", "primary_field": "M_ONLY"})
 
+        # structure_incomplete：句数不对
         if metrics.get("structure", 10) < 8:
-            tags.append("structure_incomplete")
+            tags.append({"symptom": "structure_incomplete", "primary_field": "M_ONLY"})
 
+        # tone_fail：平仄大面积崩塌
         if metrics.get("pingze", 30) < 20:
-            tags.append("tone_fail")
+            tags.append({"symptom": "tone_fail", "primary_field": "M_ONLY"})
 
+        # rhyme_fail：押韵大面积崩塌
         if metrics.get("rhyme", 20) < 15:
-            tags.append("rhyme_fail")
+            tags.append({"symptom": "rhyme_fail", "primary_field": "M_ONLY"})
 
-        # 深层诊断（F层）
-        pingze = metrics.get("pingze") or 0
-        rhyme = metrics.get("rhyme") or 0
+        # ---------- 2. 深层诊断（需要 semantic 分数） ----------
         semantic = metrics.get("semantic")
         if semantic is None:
-            return tags  # semantic 未评测，不做 F 层推断
+            if not tags:
+                tags.append({"symptom": "unknown_instability", "primary_field": "NONE"})
+            return tags
+
+        pingze = metrics.get("pingze") or 0
+        rhyme = metrics.get("rhyme") or 0
         antithesis = metrics.get("antithesis") or 0
 
-        # 格律稳定但语义空洞 → 模板化复读
+        # template_parroting：格律稳定但语义空洞 → F_imagery
         if pingze >= 25 and rhyme >= 18 and semantic <= 8:
-            tags.append("template_parroting")
+            tags.append({"symptom": "template_parroting", "primary_field": "F_imagery"})
 
-        # 对仗高分但语义低分 → 意象局部最优/失联
-        if antithesis >= 15 and semantic <= 8:
-            tags.append("F_imagery")
-
-        # 平仄正常但语义极低 → 审美熵增
+        # aesthetic_entropy：平仄正常但语义极低 → F_emotional
         if pingze >= 25 and semantic <= 8:
-            tags.append("aesthetic_entropy")
+            tags.append(
+                {"symptom": "aesthetic_entropy", "primary_field": "F_emotional"}
+            )
 
-        # 语义中等但没有亮点 → 安全平庸
+        # safe_mediocrity：语义中等但没有亮点 → NONE（无法归主导场）
         if 10 <= semantic <= 14:
-            tags.append("safe_mediocrity")
+            tags.append({"symptom": "safe_mediocrity", "primary_field": "NONE"})
+
+        # ---------- 3. fragmentation 代理规则 ----------
+        # 当 semantic 极低 + 平仄崩塌 + 非空输出 + 至少 2 句时，视为 catastrophic coherence failure proxy
+        if (
+            semantic is not None
+            and semantic <= 5
+            and pingze < 20
+            and len(generated.strip()) > 0
+            and generated.count("\n") >= 1  # 至少 2 句（一句 + 至少一个换行）
+        ):
+            tags.append({"symptom": "fragmentation", "primary_field": "NONE"})
+
+        # ---------- 4. 兜底 ----------
+        if not tags:
+            tags.append({"symptom": "unknown_instability", "primary_field": "NONE"})
 
         return tags
 
@@ -300,7 +373,12 @@ class Evaluator:
             scores["antithesis"] = 20.0
 
         # 语义（20分）
-        scores["semantic"] = round(semantic_result["score"] * 20, 2)
+        # 修复：当 semantic_result["score"] 为 None 时，安全赋予 0.0 分，避免乘法崩溃
+        sem_score = semantic_result.get("score")
+        if sem_score is None:
+            scores["semantic"] = 0.0
+        else:
+            scores["semantic"] = round(sem_score * 20, 2)
 
         total = sum(scores.values())
         return {"total": round(total, 2), "breakdown": scores, "max_total": 100}

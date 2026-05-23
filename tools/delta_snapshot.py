@@ -32,11 +32,18 @@ def load_metadata(run_dir: Path) -> dict:
 
 
 def extract_failure_modes(results: list) -> Counter:
-    """从评测结果中提取所有 error_category 标签的频次"""
+    """从评测结果中提取所有 error_category / instability_tags 中的 symptom 频次"""
     modes = Counter()
     for r in results:
-        for tag in r.get("error_category", []):
-            modes[tag] += 1
+        # 优先用结构化 instability_tags（新格式）
+        tags = r.get("instability_tags", [])
+        if tags and isinstance(tags[0], dict):
+            for tag in tags:
+                modes[tag.get("symptom", "")] += 1
+        else:
+            # 回退到旧的 error_category 字符串列表
+            for tag in r.get("error_category", []):
+                modes[tag] += 1
     return modes
 
 
