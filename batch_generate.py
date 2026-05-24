@@ -13,6 +13,11 @@ v3 更新：
 - 保留 raw_output 字段，不丢失模型原始输出
 - 冻结输入哈希 task_dataset_hash
 - 修复 [END] 误伤清洗
+
+v4 更新（MVP 重构）：
+- 使用统一 clean_text() 替代零散清洗
+- 低压 prompt suffix，移除对 [END] 的显式指令
+- reasoning 不再污染正文
 """
 
 import hashlib
@@ -25,19 +30,20 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).parent
-sys.path.insert(0, str(PROJECT_ROOT))
-
 from dotenv import load_dotenv
 
 from src.generator import create_generator
+from src.utils import clean_text
+
+PROJECT_ROOT = Path(__file__).parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
 
 load_dotenv()
 
-GENERATION_SUFFIX = (
-    "请严格只输出一首完整的词，不要任何说明、注释、标题、标点以外的符号，直接以正文开始。"
-    "词作结束后另起一行输出 [END]。"
-)
+# 低压力后缀：只给一个自然的起笔信号，不施加高压约束
+# 避免模型进入自我审查/修正/推理循环
+GENERATION_SUFFIX = "\n下面是一首《鹧鸪天》：\n"
 
 
 def sanitize_name(name: str) -> str:
@@ -161,11 +167,8 @@ def main():
 
         raw_output = gen.generate(full_prompt)
 
-        # 安全清洗：只删除末尾的 [END]
-        if raw_output.rstrip().endswith("[END]"):
-            ci_text = raw_output.rstrip()[:-5].strip()
-        else:
-            ci_text = raw_output.strip()
+        # 统一清洗正文：NFKC 归一化、去除 [END]、压缩空行
+        ci_text = clean_text(raw_output)
 
         finish_reason = getattr(gen, "last_finish_reason", "UNKNOWN")
         print(f"   finish_reason: {finish_reason}")
@@ -184,7 +187,7 @@ def main():
             "raw_output": raw_output,
             "generated": ci_text,
             "finish_reason": finish_reason,
-            # 新增：内容来源追踪
+            # 内容来源追踪
             "content_source": getattr(gen, "last_content_source", None),
             "reasoning_content": getattr(gen, "last_reasoning_content", None),
             # 透传任务层（给评测阶段用）

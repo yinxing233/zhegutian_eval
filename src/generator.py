@@ -1,5 +1,5 @@
 """
-大模型生成层（支持多 Provider）
+大语言模型生成层（支持多 Provider）
 通过环境变量配置，可切换 Gemini / DeepSeek / GLM。
 """
 
@@ -77,6 +77,7 @@ class GeminiGenerator(BaseGenerator):
                 threshold=types.HarmBlockThreshold.BLOCK_NONE,
             ),
         ]
+        # 停止序列：仅通过 API 控制，prompt 不再提及 [END]
         self.stop_sequences = ["[END]"]
         self.generation_config = types.GenerateContentConfig(
             temperature=temperature,
@@ -174,6 +175,7 @@ class DeepSeekGenerator(BaseGenerator):
         """
         多 schema 容错提取，返回 (text, source)。
         source ∈ {"content", "reasoning_content", "fallback_dict"}
+        重要：reasoning_content 只作为观测信号保留，不回退为正文。
         """
         if not choice:
             return "", "empty_choice"
@@ -190,8 +192,9 @@ class DeepSeekGenerator(BaseGenerator):
         # ---------- 尝试 2：reasoning_content ----------
         reasoning = getattr(message, "reasoning_content", None)
         if reasoning and isinstance(reasoning, str) and reasoning.strip():
+            # 记录推理链作为观测信号，但正文返回空
             self.last_reasoning_content = reasoning.strip()
-            return reasoning.strip(), "reasoning_content"
+            return "", "reasoning_content"
 
         # ---------- 尝试 3：dict fallback ----------
         try:
@@ -242,11 +245,15 @@ class DeepSeekGenerator(BaseGenerator):
             text, source = self._safe_extract_content(choice)
             self.last_content_source = source
 
+            # 如果正文为空且是 reasoning_content 导致的，返回空串（观测信号）
             if not text.strip():
-                return (
-                    "[Error: Empty completion returned by provider. "
-                    f"finish_reason={self.last_finish_reason}]"
-                )
+                if source == "reasoning_content":
+                    return ""
+                else:
+                    return (
+                        "[Error: Empty completion returned by provider. "
+                        f"finish_reason={self.last_finish_reason}]"
+                    )
 
             return text.strip()
 
