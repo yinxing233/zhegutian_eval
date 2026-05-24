@@ -15,9 +15,10 @@ v3 更新：
 - 修复 [END] 误伤清洗
 
 v4 更新（MVP 重构）：
-- 使用统一 clean_text() 替代零散清洗
+- 使用统一 clean_text() 替代零散清洗（通用卫生层）
 - 低压 prompt suffix，移除对 [END] 的显式指令
-- reasoning 不再污染正文
+- reasoning 不再污染正文（generator 层隔离）
+- 按 provider 分流清洗：Gemini 仅最小清洗，GLM 附加正文提取
 """
 
 import hashlib
@@ -33,17 +34,51 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from src.generator import create_generator
-from src.utils import clean_text
+from utils.extractor import extract_ci_text
+from utils.text_cleaner import clean_text
 
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-
 load_dotenv()
 
-# 低压力后缀：只给一个自然的起笔信号，不施加高压约束
-# 避免模型进入自我审查/修正/推理循环
-GENERATION_SUFFIX = "\n下面是一首《鹧鸪天》：\n"
+# ============================================================
+# ProviderAdapter：隔离所有 provider 差异
+# 每个 provider 有独立的 prompt_suffix 和 postprocess 函数
+# ============================================================
+
+
+def _identity(text: str) -> str:
+    """不做任何后处理，直接透传"""
+    return text
+
+
+PROVIDER_CONFIG = {
+    "gemini": {
+        # Gemini 需要轻度指令防止它进入"先解释再写词"模式
+        # 但不使用"严格""禁止"等高压词，避免触发审查态
+        "prompt_suffix": "\n请直接写出这首词，不要任何说明、注释或背景介绍：\n",
+        "postprocess": _identity,
+    },
+    "deepseek": {
+        # DeepSeek 的 reasoning 已在 generator 层隔离
+        # 低压 continuation 风格即可
+        "prompt_suffix": "\n下面是一首《鹧鸪天》：\n",
+        "postprocess": _identity,
+    },
+    "glm": {
+        # GLM 输出 final_answer + self_explanation
+        # 需要 extract_ci_text 提取正文
+        "prompt_suffix": "\n下面是一首《鹧鸪天》：\n",
+        "postprocess": extract_ci_text,
+    },
+}
+
+# 默认配置（未知 provider 的回退）
+DEFAULT_PROVIDER_CONFIG = {
+    "prompt_suffix": "\n下面是一首《鹧鸪天》：\n",
+    "postprocess": _identity,
+}
 
 
 def sanitize_name(name: str) -> str:
@@ -90,6 +125,13 @@ def main():
     temperature = gen.temperature
     max_tokens = gen.max_output_tokens
     delay = float(os.getenv("API_DELAY_SECONDS", "0"))
+
+    # 获取当前 provider 的配置
+    provider_cfg = PROVIDER_CONFIG.get(gen_provider.lower(), DEFAULT_PROVIDER_CONFIG)
+    prompt_suffix = provider_cfg["prompt_suffix"]
+    postprocess = provider_cfg["postprocess"]
+
+    print(f"🔧 Provider: {gen_provider} | suffix: {prompt_suffix.strip()}")
 
     # ----- 构建实验运行目录与唯一 ID -----
     runs_base = PROJECT_ROOT / "runs"
@@ -144,7 +186,7 @@ def main():
         "gen_provider": gen_provider,
         "judge_model": judge_model,
         "judge_provider": judge_provider,
-        "prompt_version": "unknown",
+        "prompt_version": "v4-provider-adapter",
         "git_commit": git_commit,
         "parent_run": None,
         "description": "",
@@ -162,13 +204,17 @@ def main():
         surface_prompt = sample["L0_surface_prompt"]
         prompt_version = sample["prompt_version"]
 
-        full_prompt = surface_prompt + GENERATION_SUFFIX
+        # Provider 自适应 prompt
+        full_prompt = surface_prompt + prompt_suffix
         print(f"⚙️ [{idx + 1}/{len(samples)}] 生成 {task_id} ...")
 
         raw_output = gen.generate(full_prompt)
 
-        # 统一清洗正文：NFKC 归一化、去除 [END]、压缩空行
-        ci_text = clean_text(raw_output)
+        # 通用卫生层（所有 provider）
+        cleaned = clean_text(raw_output)
+
+        # Provider 特定的后处理
+        ci_text = postprocess(cleaned)
 
         finish_reason = getattr(gen, "last_finish_reason", "UNKNOWN")
         print(f"   finish_reason: {finish_reason}")

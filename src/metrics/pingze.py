@@ -3,15 +3,12 @@
 基于单句规则模板，计算平仄匹配度
 """
 
-from typing import List, Dict, Any
-from src.utils import is_ping, is_ze
+from typing import Any, Dict, List
+
+from utils.text_utils import is_ping
 
 
-def check_line(
-    line: str,
-    text_tpl: str,
-    strict_positions: List[int]
-) -> Dict[str, Any]:
+def check_line(line: str, text_tpl: str, strict_positions: List[int]) -> Dict[str, Any]:
     """
     检查单句平仄是否符合规则模板。
 
@@ -33,7 +30,7 @@ def check_line(
             "char_count_ok": False,
             "pingze_match_ratio": 0.0,
             "strict_match_ratio": 0.0,
-            "error_positions": []
+            "error_positions": [],
         }
 
     total_checked = 0
@@ -48,7 +45,7 @@ def check_line(
             continue  # 不检查
 
         total_checked += 1
-        expected_ping = (tpl == "平")
+        expected_ping = tpl == "平"
         actual_ping = is_ping(char)
 
         if expected_ping == actual_ping:
@@ -68,5 +65,5 @@ def check_line(
         "char_count_ok": True,
         "pingze_match_ratio": round(match_ratio, 4),
         "strict_match_ratio": round(strict_ratio, 4),
-        "error_positions": errors
+        "error_positions": errors,
     }

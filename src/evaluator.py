@@ -11,7 +11,7 @@ from src.metrics.pingze import check_line
 from src.metrics.rhyme import check_rhyme, get_yunbu, load_yunbu_table
 from src.metrics.semantic import check_semantic
 from src.schema.rule_config import RuleConfig
-from src.utils import split_into_lines
+from utils.text_utils import split_into_lines
 
 
 def _object_to_dict(obj) -> Optional[Dict[str, Any]]:

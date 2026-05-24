@@ -5,8 +5,9 @@
 
 import json
 from pathlib import Path
-from typing import List, Dict, Any
-from src.utils import get_pinyin
+from typing import Any, Dict, List
+
+from utils.text_utils import get_pinyin
 
 
 def load_yunbu_table(path: str = None) -> Dict[str, str]:
@@ -31,8 +32,7 @@ def get_yunbu(char: str, yunbu_table: Dict[str, str]) -> str:
 
 
 def check_rhyme(
-    rhyme_chars: List[str],
-    yunbu_table: Dict[str, str] = None
+    rhyme_chars: List[str], yunbu_table: Dict[str, str] = None
 ) -> Dict[str, Any]:
     """
     检查一组韵脚字是否押韵（同属一个韵部）。
@@ -60,7 +60,7 @@ def check_rhyme(
             "rhyme_ok": False,
             "yunbu_name": "无",
             "char_yunbu": char_yunbu,
-            "detail": "无法识别任何韵脚字"
+            "detail": "无法识别任何韵脚字",
         }
 
     first_yunbu = known[0]
@@ -70,5 +70,5 @@ def check_rhyme(
         "rhyme_ok": all_same,
         "yunbu_name": first_yunbu if all_same else "混押",
         "char_yunbu": char_yunbu,
-        "detail": "全押同一韵部" if all_same else f"韵部不一致: {char_yunbu}"
+        "detail": "全押同一韵部" if all_same else f"韵部不一致: {char_yunbu}",
     }

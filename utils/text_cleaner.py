@@ -1,46 +1,31 @@
 """
 统一文本清洗工具
-MVP 版本：做最小必要处理，保证产出干净的正文
+clean_text: 通用卫生层（所有 provider 通用）
 """
 
 import unicodedata
 
 
 def clean_text(text: str) -> str:
-    """统一清洗生成文本，消除协议污染"""
+    """
+    通用卫生层：只做所有 provider 都安全的操作。
+    - NFKC 归一化
+    - 移除末尾 [END]
+    - 首尾空白清理
+    不做空行压缩、不做正文提取、不删任何内容。
+    """
     if text is None:
         return ""
 
-    # 1. 首尾空白
     text = text.strip()
     if not text:
         return ""
 
-    # 2. Unicode NFKC 归一化
+    # Unicode NFKC 归一化（token manifold normalization）
     text = unicodedata.normalize("NFKC", text)
 
-    # 3. 删除末尾的 [END]（允许后面跟空白）
+    # 删除末尾的 [END]
     if text.rstrip().endswith("[END]"):
         text = text.rstrip()[:-5].strip()
 
-    # 4. 压缩首尾多余空行，保留内部最多一个连续空行
-    lines = text.splitlines()
-    # 去除开头和结尾的空行
-    while lines and lines[0].strip() == "":
-        lines.pop(0)
-    while lines and lines[-1].strip() == "":
-        lines.pop()
-
-    cleaned = []
-    prev_empty = False
-    for line in lines:
-        if line.strip() == "":
-            if not prev_empty:
-                cleaned.append("")
-                prev_empty = True
-        else:
-            cleaned.append(line)
-            prev_empty = False
-
-    text = "\n".join(cleaned).strip()
     return text

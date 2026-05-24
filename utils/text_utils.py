@@ -1,9 +1,9 @@
-# src/utils.py
 """
-文本处理工具函数
-- 文本清洗（去标点/空格）
+文本处理工具函数（评测层）
 - 断句（按标点）
 - 拼音与声调提取（基于 pypinyin，现代汉语普通话）
+- 平仄判断
+- 非汉字剥离（仅用于韵书匹配等特殊场景，严禁用于生成文本清洗）
 
 音韵体系说明：
 MVP 阶段使用中华新韵（现代汉语），基于 pypinyin 库。
@@ -13,48 +13,68 @@ MVP 阶段使用中华新韵（现代汉语），基于 pypinyin 库。
   1. 替换 is_ping/is_ze 函数（需引入入声字表）
   2. 替换 metrics/rhyme.py 中的韵部映射表
   3. 无其他文件受影响
+
+⚠️ 重要边界：
+  生成文本的清洗请使用 src/utils/text_cleaner.py 中的 clean_text()。
+  本模块的 strip_non_han() 会删除所有非汉字符号（包括换行和标点），
+  仅适用于韵脚提取、平仄匹配等需要纯汉字序列的场景，
+  严禁用于生成 pipeline 的正文预处理。
 """
 
 import re
 from typing import List, Tuple
-from pypinyin import pinyin, Style
+
+from pypinyin import Style, pinyin
 
 # ---------------------------
 # 常量定义
 # ---------------------------
 
-SENTENCE_DELIMITERS = re.compile(r'[，。！？、；：,.!?;:\s]+')
-HAN_ONLY = re.compile(r'[^\u4e00-\u9fff]')
+SENTENCE_DELIMITERS = re.compile(r"[，。！？、；：,.!?;:\s]+")
+HAN_ONLY = re.compile(r"[^\u4e00-\u9fff]")
+
 
 # ---------------------------
-# 文本清洗与断句
+# 文本断句
 # ---------------------------
-
-def clean_text(text: str) -> str:
-    """去除所有非汉字符号，返回纯汉字字符串"""
-    return HAN_ONLY.sub('', text)
 
 
 def split_into_lines(text: str) -> List[str]:
     """
     将词作文本按标点分割为句子列表。
     去除非汉字符号，过滤空字符串。
-    
+
     注意：此函数不保证返回的句数与任何特定词牌匹配。
     对齐词牌结构是 evaluator 的职责。
     """
     raw_parts = re.split(SENTENCE_DELIMITERS, text.strip())
     parts = []
     for p in raw_parts:
-        c = clean_text(p)
+        c = HAN_ONLY.sub("", p)
         if c:
             parts.append(c)
     return parts
 
 
 # ---------------------------
+# 非汉字剥离（仅用于韵书/平仄匹配）
+# ---------------------------
+
+
+def strip_non_han(text: str) -> str:
+    """
+    去除所有非汉字符号，返回纯汉字字符串。
+    ⚠️ 此函数会删除换行、标点、空格等所有非 CJK 字符。
+    严禁用于生成 pipeline 的正文预处理。
+    仅适用于：韵脚提取、平仄匹配等需要纯汉字序列的场景。
+    """
+    return HAN_ONLY.sub("", text)
+
+
+# ---------------------------
 # 拼音与声调（单字）
 # ---------------------------
+
 
 def get_pinyin_tone(char: str) -> Tuple[str, int]:
     """
@@ -65,7 +85,7 @@ def get_pinyin_tone(char: str) -> Tuple[str, int]:
     if len(char) != 1:
         raise ValueError("只接受单个汉字")
     py = pinyin(char, style=Style.TONE3, heteronym=False)[0][0]
-    match = re.match(r'^([a-zA-ZüÜ]+)(\d)$', py)
+    match = re.match(r"^([a-zA-ZüÜ]+)(\d)$", py)
     if match:
         syllable = match.group(1)
         tone = int(match.group(2))
@@ -99,6 +119,7 @@ def is_ze(char: str) -> bool:
 # ---------------------------
 # 批量操作（整句）
 # ---------------------------
+
 
 def get_tones(line: str) -> List[int]:
     """返回一行中每个字的声调列表"""
