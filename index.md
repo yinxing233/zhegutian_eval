@@ -28,9 +28,9 @@
 - [📖 项目总览与快速开始](https://github.com/yinxing233/zhegutian_eval)
 - [💡 设计哲学](./docs/philosophy/philosophy.md) – 为何这样定义评测
 - [🏗️ 系统工程与架构](./docs/architecture/architecture.md)
-- [🗂️ 项目骨架](./docs/engineering/PROJECT_MAP.md)
+- [🗂️ 项目骨架](./docs/architecture/PROJECT_MAP.md)
 - [📚 概念定义](./docs/philosophy/concepts.md)
-- [⌚️ 未来方向](./docs/bad_cases.md)
+- [⌚️ 未来方向](./docs/philosophy/future.md)
 
 ---
 

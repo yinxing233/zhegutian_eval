@@ -2,7 +2,7 @@
 
 ```markdown
 zhegutian-eval/
-├── .env # API Key 和生成参数（不进入版本控制）
+├── .env # API Key 和生成参数示例（不进入版本控制）
 ├── data/
 │ └── zhonghua_xinyun.json # 中华新韵韵部映射表
 ├── rules/
@@ -18,14 +18,22 @@ zhegutian-eval/
 │ │ └── rule_config.py # 规则结构定义（强类型对象）
 │ ├── **init**.py
 │ ├── evaluator.py # 评测调度层（100分制，5维度）
-│ ├── generator.py # 大模型生成层（当前支持 Gemini，DeepSeek,GLM，策略+工厂模式）
+│ ├── generator.py # 大模型生成层（支持 Gemini、DeepSeek、GLM，策略+工厂模式）
 │ ├── llm_client.py # 统一 LLM 调用客户端（用于评测模块）
-│ ├── main.py # 程序入口
-│ └── utils.py # 文本清洗、断句、拼音/声调提取（纯工具）
+│ └── main.py # 程序入口
 ├── tools/
+│ ├── **init**.py
 │ └── delta_snapshot.py # 增量快照工具
+├── utils/
+│ ├── **init**.py
+│ ├── extractor.py # 文本提取 / 特征抽取
+│ ├── text_cleaner.py # 文本清洗
+│ └── text_utils.py # 断句、拼音/声调提取等通用工具
 ├── batch_evaluate.py # 批量评测脚本
 ├── batch_generate.py # 批量生成脚本
+├── index.md # GithubPages索引页
+├── _config.yml # GithubPages站点配置文件
 ├── pyproject.toml # uv 项目文件
+├── README.md # 项目说明
 └── uv.lock
 ```

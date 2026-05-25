@@ -48,6 +48,8 @@
 
 > 用来观察模型失败方式的实验系统。
 
+![结构约束下的生成行为观测示意图](docs/images/zhegutian.png)
+
 ---
 
 # 当前状态
@@ -62,6 +64,8 @@
 - 实验漂移差分分析（Delta Snapshot）
 
 当前内置多个不同压力梯度的《鹧鸪天》测试样本，用于观察模型在高约束生成中的失稳模式。
+
+[详细文档](https://yinxing233.github.io/zhegutian_eval/)
 
 ---
 
