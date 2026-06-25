@@ -29,7 +29,12 @@ ENV/
 .roo/
 debts/
 #docs/
+goal/
 plans/
+#report/
+report/capability_mapping.md
+report/data_analysis.md
+report/iteration_trace.md
 
 DESIGN_DECISIONS_ARCHIVE.md
 阶段性总结.md
@@ -43,7 +48,7 @@ runs/
 *.log
 run_archive
 eval_results.json
-generated_results.jsonl
+#generated_results.jsonl
 
 # =================================================================
 # 4. 编辑器与操作系统 (个人偏好文件)
@@ -60,3 +65,4 @@ Thumbs.db
 # =================================================================
 .env
 .env.*
+!.env.example

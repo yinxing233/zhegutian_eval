@@ -52,6 +52,22 @@
 
 ---
 
+# 核心发现：三种不同的失稳拓扑
+
+实验对 Gemini / DeepSeek / GLM 三个模型各运行 N=25 次，发现三种**确定性**、**可重现**的失败路径：
+
+| 模型 | 主要失稳模式 | 表现 |
+|------|------------|------|
+| Gemini | `safe_mediocrity` | 高压约束下退回训练集安全模板，意象失联但格律尚存（归一化得分 82.4%） |
+| DeepSeek | `reasoning_overflow` | 推理链耗尽全部 token，正文为空，**空洞率 80%**（N=25 中 20 次） |
+| GLM | `instruction_anchoring` | 每首词后强制附加格律赏析 300–800 字，无法被任何 prompt 约束 |
+
+这三种失败路径不是随机噪声。它们分别对应三种不同的注意力竞争结构——**Generation / Reasoning / Instruction** 三角形的不同顶点：每个模型在极限约束下，都沿自身架构最优先的方向失控。
+
+> 完整分析与行为拓扑框架见：[鹧鸪天项目报告.pdf](report/鹧鸪天项目报告.pdf)
+
+---
+
 # 当前状态
 
 当前项目为可运行 MVP，已完成：
@@ -281,13 +297,15 @@ uv sync
 
 ## 3. 配置 `.env`
 
-```env
-LLM_PROVIDER=deepseek
-DEEPSEEK_API_KEY=your_key
+```bash
+# Linux / macOS
+cp .env.example .env
 
-EVAL_PROVIDER=deepseek
-EVAL_MODEL=deepseek-v4-flash
+# Windows
+copy .env.example .env
 ```
+
+然后编辑 `.env`，填入你使用的 Provider 的 API Key。
 
 ## 4. 运行生成
 
