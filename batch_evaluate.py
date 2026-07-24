@@ -70,6 +70,44 @@ def resolve_run_dir(run_id: Optional[str] = None) -> Path:
     return all_runs[0]
 
 
+def _append_judge_failure(
+    judge_failure_path: Path,
+    task_id: str,
+    judge_model: str,
+    judge_provider: str,
+    error_type: str,
+    raw: str,
+) -> None:
+    """追加一条裁判故障记录（judge failure）。"""
+    judge_failure_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(judge_failure_path, "a", encoding="utf-8") as jf:
+        failure_record = {
+            "timestamp": datetime.now().isoformat(),
+            "task_id": task_id,
+            "judge_model": judge_model,
+            "provider": judge_provider,
+            "error_type": error_type,
+            "raw": raw,
+        }
+        jf.write(json.dumps(failure_record, ensure_ascii=False) + "\n")
+
+
+# 仅这些「硬失败」症状会触发 badcase 标记；
+# safe_mediocrity / unknown_instability 等为信息性标签，不构成 badcase。
+HARD_FAILURES = {
+    "reasoning_overflow",
+    "empty_output",
+    "truncated",
+    "structure_incomplete",
+    "tone_fail",
+    "rhyme_fail",
+    "template_parroting",
+    "aesthetic_entropy",
+    "fragmentation",
+    "generation_truncated",
+}
+
+
 def main():
     # 解析命令行参数
     run_id = None
@@ -92,6 +130,11 @@ def main():
     output_path = run_dir / "eval_results.jsonl"
     badcase_path = run_dir / "badcase_pool.jsonl"
     judge_failure_path = run_dir / "judge_failures.jsonl"
+
+    # 清理旧输出，保证 replay 幂等（避免 badcase / judge_failures 重复累积）
+    for p in (output_path, badcase_path, judge_failure_path):
+        if p.exists():
+            p.unlink()
 
     print(f"📂 使用运行目录：{run_dir}")
 
@@ -138,11 +181,12 @@ def main():
 
         print(f"🔍 [{idx + 1}/{len(records)}] 评测 {task_id} ...")
 
-        # 只做一次本地评测（格律部分）
+        # 第一步：纯规则筛选（跳过所有 LLM 评测，先筛后评，节省配额）
         eval_result = evaluator.evaluate(
             ci_text,
             prompt_context=prompt_context,
             skip_semantic=True,
+            skip_antithesis=True,
             constraints=constraints,
         )
         breakdown = eval_result["overall"]["breakdown"]
@@ -150,67 +194,73 @@ def main():
         rhyme_score = breakdown["rhyme"]
         pingze_score = breakdown["pingze"]
 
-        # 判断是否触发 LLM 语义评测
-        do_semantic = (
+        # 格律通过阈值才触发 LLM 评测（对仗 + 语义）
+        do_llm = (
             structure_score >= STRUCTURE_FULL * STRUCTURE_RHYME_THRESHOLD_RATIO
             and rhyme_score >= RHYME_FULL * STRUCTURE_RHYME_THRESHOLD_RATIO
             and pingze_score > MIN_PINGZE_FOR_SEMANTIC
         )
 
-        # 初始化语义结果为占位对象（避免后续访问 NameError）
+        # 初始化评测结果占位对象
         semantic_result = {
             "success": False,
             "score": None,
             "error_type": "not_evaluated",
             "raw": "",
         }
+        antithesis_score = None
         missing_reason = {}
+        evaluated_dims = ["structure", "pingze", "rhyme"]
 
-        if do_semantic:
-            print("   → 触发 LLM 语义评测")
-            semantic_result = evaluator.evaluate_semantic_only(ci_text, prompt_context)
+        if do_llm:
+            print("   → 触发 LLM 评测（对仗 + 语义）")
 
-            if semantic_result.get("success"):
-                semantic_score = round(semantic_result["score"] * 20, 2)
-                semantic_evaluated = True
-                evaluated_dims = [
-                    "structure",
-                    "pingze",
-                    "rhyme",
-                    "antithesis",
-                    "semantic",
-                ]
+            # 对仗评测
+            antithesis_raw = evaluator.evaluate_antithesis_only(ci_text)
+            if antithesis_raw is not None:
+                antithesis_score = round(antithesis_raw * 20, 2)
+                evaluated_dims.append("antithesis")
             else:
-                semantic_score = None
-                semantic_evaluated = False
-                evaluated_dims = ["structure", "pingze", "rhyme", "antithesis"]
+                missing_reason["antithesis"] = "judge_fail"
+                _append_judge_failure(
+                    judge_failure_path,
+                    task_id,
+                    judge_model,
+                    judge_provider,
+                    "antithesis_eval_failed",
+                    "",
+                )
+
+            # 语义评测
+            semantic_result = evaluator.evaluate_semantic_only(ci_text, prompt_context)
+            if semantic_result.get("success"):
+                evaluated_dims.append("semantic")
+            else:
                 error_type = semantic_result.get("error_type", "unknown")
                 missing_reason["semantic"] = f"judge_fail:{error_type}"
-
-                # 追加裁判故障记录
-                judge_failure_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(judge_failure_path, "a", encoding="utf-8") as jf:
-                    failure_record = {
-                        "timestamp": datetime.now().isoformat(),
-                        "task_id": task_id,
-                        "judge_model": judge_model,
-                        "provider": judge_provider,
-                        "error_type": error_type,
-                        "raw": semantic_result.get("raw", "")[:500],
-                    }
-                    jf.write(json.dumps(failure_record, ensure_ascii=False) + "\n")
+                _append_judge_failure(
+                    judge_failure_path,
+                    task_id,
+                    judge_model,
+                    judge_provider,
+                    error_type,
+                    semantic_result.get("raw", "")[:500],
+                )
         else:
-            semantic_score = None
-            semantic_evaluated = False
-            evaluated_dims = ["structure", "pingze", "rhyme", "antithesis"]
+            missing_reason["antithesis"] = "rule_skip"
             missing_reason["semantic"] = "rule_skip"
 
-        # 组装指标
+        semantic_score = semantic_result.get("score")
+        if semantic_score is not None:
+            semantic_score = round(semantic_score * 20, 2)
+        semantic_evaluated = semantic_result.get("success", False)
+
+        # 组装指标（未评测维度为 None，由覆盖率处理）
         metrics = {
             "structure": structure_score,
             "pingze": pingze_score,
             "rhyme": rhyme_score,
-            "antithesis": breakdown.get("antithesis", 0),
+            "antithesis": antithesis_score,
             "semantic": semantic_score,
         }
 
@@ -239,14 +289,17 @@ def main():
                 t for t in error_category if t != "generation_truncated"
             ]
 
+        # 仅「硬失败」症状触发 badcase；safe_mediocrity / unknown_instability
+        # 等为信息性标签，不意味着样本是坏案例
+        hard_failures = [t for t in error_category if t in HARD_FAILURES]
         is_badcase = (
             normalized_score < 60
-            or len(error_category) > 0
+            or len(hard_failures) > 0
             or ci_text.startswith("[Error:")
             or ci_text.startswith("[API Error:")
             or finish_reason == "MAX_TOKENS"
         )
-        badcase_reason = "; ".join(error_category) if error_category else ""
+        badcase_reason = "; ".join(hard_failures) if hard_failures else ""
 
         snapshot = {
             "batch_run_id": record.get("batch_run_id", run_dir.name),

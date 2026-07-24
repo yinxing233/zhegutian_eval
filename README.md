@@ -205,7 +205,7 @@ flowchart TD
 
 更多案例见：
 
-* `docs/bad_cases.md`
+* `report/data_analysis.md`
 
 ---
 
@@ -354,7 +354,7 @@ uv run tools/delta_snapshot.py runs/run_A runs/run_B
 更完整讨论见：
 
 * `docs/philosophy/philosophy.md`
-* `docs/engineering/PROJECT_MAP.md`
+* `docs/architecture/PROJECT_MAP.md`
 
 ---
 

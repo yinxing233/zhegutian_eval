@@ -20,7 +20,7 @@ zhegutian-eval/
 │ ├── evaluator.py # 评测调度层（100分制，5维度）
 │ ├── generator.py # 大模型生成层（支持 Gemini、DeepSeek、GLM，策略+工厂模式）
 │ ├── llm_client.py # 统一 LLM 调用客户端（用于评测模块）
-│ └── main.py # 程序入口
+│ └── main.py # 调试入口（打印规则结构，非评测主入口）
 ├── tools/
 │ ├── **init**.py
 │ └── delta_snapshot.py # 增量快照工具
@@ -29,8 +29,8 @@ zhegutian-eval/
 │ ├── extractor.py # 文本提取 / 特征抽取
 │ ├── text_cleaner.py # 文本清洗
 │ └── text_utils.py # 断句、拼音/声调提取等通用工具
-├── batch_evaluate.py # 批量评测脚本
-├── batch_generate.py # 批量生成脚本
+├── batch_generate.py # 批量生成入口（真正的生成入口）
+├── batch_evaluate.py # 批量评测入口（真正的评测入口）
 ├── index.md # GithubPages索引页
 ├── _config.yml # GithubPages站点配置文件
 ├── pyproject.toml # uv 项目文件

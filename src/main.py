@@ -1,6 +1,14 @@
 # src/main.py
 
-from schema.rule_config import load_rule_config
+import sys
+from pathlib import Path
+
+# 确保项目根目录在 sys.path 中，使 `src.` 与 `utils.` 导入一致可用
+PROJECT_ROOT = Path(__file__).parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.schema.rule_config import load_rule_config
 
 
 def main():

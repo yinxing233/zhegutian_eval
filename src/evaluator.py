@@ -42,6 +42,7 @@ class Evaluator:
         ci_text: str,
         prompt_context: str = "",
         skip_semantic: bool = False,
+        skip_antithesis: bool = False,
         constraints: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -77,62 +78,33 @@ class Evaluator:
                 rhyme_chars.append(line[-1] if line else "")
         rhyme_result = check_rhyme(rhyme_chars, self.yunbu_table)
 
-        # 5. 对仗检查
+        # 5. 对仗检查（LLM-based，可跳过以节省评测配额）
         antithesis_results = []
-        antithesis_config = None
-        if hasattr(self.rule, "special_rules") and self.rule.special_rules:
-            sr = self.rule.special_rules
-            if hasattr(sr, "antithesis"):
-                antithesis_config = _object_to_dict(sr.antithesis)
-
-        required_pairs = []
-        recommended_pairs = []
-        if isinstance(antithesis_config, dict):
-            required_pairs = antithesis_config.get("required", [])
-            recommended_pairs = antithesis_config.get("recommended", [])
-
-        if not required_pairs and not recommended_pairs:
-            if len(lines) >= 4:
-                required_pairs = [[3, 4]]
-            if len(lines) >= 6:
-                recommended_pairs = [[5, 6]]
-
-        for pair in required_pairs:
-            if isinstance(pair, list) and len(pair) == 2:
-                idx_a, idx_b = pair[0] - 1, pair[1] - 1
-                if idx_a < len(lines) and idx_b < len(lines):
-                    res = check_antithesis(
-                        lines[idx_a], lines[idx_b], antithesis_config
-                    )
-                    res["sentence_pair"] = [idx_a + 1, idx_b + 1]
-                    antithesis_results.append(res)
-
-        for pair in recommended_pairs:
-            if isinstance(pair, list) and len(pair) == 2:
-                idx_a, idx_b = pair[0] - 1, pair[1] - 1
-                if idx_a < len(lines) and idx_b < len(lines):
-                    res = check_antithesis(
-                        lines[idx_a], lines[idx_b], antithesis_config
-                    )
-                    res["sentence_pair"] = [idx_a + 1, idx_b + 1]
-                    res["type"] = "recommended"
-                    antithesis_results.append(res)
+        if not skip_antithesis:
+            for item in self._collect_antithesis_pairs(lines):
+                idx_a, idx_b, rule_detail = item
+                res = check_antithesis(lines[idx_a], lines[idx_b], rule_detail)
+                res["sentence_pair"] = [idx_a + 1, idx_b + 1]
+                antithesis_results.append(res)
 
         # 6. 语义检查（可根据开关跳过）
         if skip_semantic:
             semantic_result = {
-                "score": 0.0,
+                "success": False,
+                "score": None,
+                "error_type": "skip_semantic",
                 "reason": "语义评测已跳过（skip_semantic=True）",
             }
         else:
             semantic_result = check_semantic(ci_text, prompt_context)
 
         # 7. 汇总基础得分
+        # 跳过对仗评测时，传入 None 表示该维度未评测（不计入总分）
         overall = self._compute_overall(
             structure_ok,
             pingze_results,
             rhyme_result,
-            antithesis_results,
+            antithesis_results if not skip_antithesis else None,
             semantic_result,
         )
         scores = overall["breakdown"]
@@ -149,12 +121,17 @@ class Evaluator:
                 # 每个违规韵脚扣 3 分，上限扣完韵部分
                 scores["rhyme"] = max(0.0, scores["rhyme"] - violation_count * 3)
 
-            # 8.2 必含词检查
+            # 8.2 必含词检查（仅在语义已评测时扣分；跳过/未评测时记录缺失原因）
             required_words = constraints.get("required_words", [])
             if required_words:
                 missing = [w for w in required_words if w not in ci_text]
                 if missing:
-                    scores["semantic"] = max(0.0, scores["semantic"] - len(missing) * 5)
+                    if "semantic" in scores:
+                        scores["semantic"] = max(0.0, scores["semantic"] - len(missing) * 5)
+                    else:
+                        semantic_missing_reason = (
+                            f"missing_required_words:{','.join(missing)}"
+                        )
 
             # 重新计算总分
             overall["total"] = round(sum(scores.values()), 2)
@@ -328,10 +305,14 @@ class Evaluator:
         structure_ok: bool,
         pingze_results: List[Dict],
         rhyme_result: Dict,
-        antithesis_results: List[Dict],
+        antithesis_results: Optional[List[Dict]],
         semantic_result: Dict,
     ) -> Dict[str, Any]:
-        """计算总分及各项得分（100分制）"""
+        """计算总分及各项得分（100分制）。
+
+        未评测维度（antithesis_results is None 或 semantic score is None）不计入
+        breakdown 与总分，交由上层据覆盖率处理，遵循「缺失 ≠ 低质量」原则。
+        """
         scores = {}
 
         # 结构（10分）
@@ -363,21 +344,20 @@ class Evaluator:
             else:
                 scores["rhyme"] = 0.0
 
-        # 对仗（20分）
-        if antithesis_results:
-            avg_anti = sum(r["score"] for r in antithesis_results) / len(
-                antithesis_results
-            )
-            scores["antithesis"] = round(avg_anti * 20, 2)
-        else:
-            scores["antithesis"] = 20.0
+        # 对仗（20分）：仅在真正评测时计入
+        if antithesis_results is not None:
+            if antithesis_results:
+                avg_anti = sum(r["score"] for r in antithesis_results) / len(
+                    antithesis_results
+                )
+                scores["antithesis"] = round(avg_anti * 20, 2)
+            else:
+                # 结构破碎到无法成对：不给满分，记 0 分
+                scores["antithesis"] = 0.0
 
-        # 语义（20分）
-        # 修复：当 semantic_result["score"] 为 None 时，安全赋予 0.0 分，避免乘法崩溃
+        # 语义（20分）：None 表示未评测（跳过或裁判故障），不计入
         sem_score = semantic_result.get("score")
-        if sem_score is None:
-            scores["semantic"] = 0.0
-        else:
+        if sem_score is not None:
             scores["semantic"] = round(sem_score * 20, 2)
 
         total = sum(scores.values())
@@ -392,3 +372,75 @@ class Evaluator:
         保持 evaluator 为唯一评测入口。
         """
         return check_semantic(ci_text, prompt_context)
+
+    def _collect_antithesis_pairs(
+        self, lines: List[str]
+    ) -> List[tuple]:
+        """收集需要对仗检查的句对。
+
+        返回 [(idx_a, idx_b, rule_detail), ...]，下标为 0-based。
+        rule_detail 为单条对仗规则字典（含 desc/type），供 LLM 裁判感知约束。
+        规则未配置时按词牌默认位置兜底（上阕三四句必对、下阕三五句宜对）。
+        """
+        pairs: List[tuple] = []
+        antithesis_config = None
+        if hasattr(self.rule, "special_rules") and self.rule.special_rules:
+            sr = self.rule.special_rules
+            if hasattr(sr, "antithesis"):
+                antithesis_config = _object_to_dict(sr.antithesis)
+
+        required_items = []
+        recommended_items = []
+        if isinstance(antithesis_config, dict):
+            required_items = antithesis_config.get("required", []) or []
+            recommended_items = antithesis_config.get("recommended", []) or []
+
+        # 兜底：规则未配置对仗时，按词牌默认位置推断
+        if not required_items and not recommended_items:
+            if len(lines) >= 4:
+                required_items = [
+                    {"pair": [3, 4], "desc": "", "type": "strict", "weight": 1.0}
+                ]
+            if len(lines) >= 6:
+                recommended_items = [
+                    {"pair": [5, 6], "desc": "", "type": "soft", "weight": 0.5}
+                ]
+
+        for item in required_items:
+            pair = item.get("pair") if isinstance(item, dict) else item
+            if isinstance(pair, list) and len(pair) == 2:
+                idx_a, idx_b = pair[0] - 1, pair[1] - 1
+                if idx_a < len(lines) and idx_b < len(lines):
+                    pairs.append((idx_a, idx_b, item if isinstance(item, dict) else None))
+
+        for item in recommended_items:
+            pair = item.get("pair") if isinstance(item, dict) else item
+            if isinstance(pair, list) and len(pair) == 2:
+                idx_a, idx_b = pair[0] - 1, pair[1] - 1
+                if idx_a < len(lines) and idx_b < len(lines):
+                    pairs.append((idx_a, idx_b, item if isinstance(item, dict) else None))
+
+        return pairs
+
+    def evaluate_antithesis_only(self, ci_text: str) -> Optional[float]:
+        """
+        单独进行对仗评测（不重复计算格律）。
+        用于 pipeline 在格律通过筛选后，按需补评对仗。
+        返回 0~1 平均分；若结构过短无法成对或裁判故障，返回 None。
+        """
+        lines = split_into_lines(ci_text)
+        pairs = self._collect_antithesis_pairs(lines)
+        if not pairs:
+            return None
+
+        scores = []
+        for idx_a, idx_b, rule_detail in pairs:
+            res = check_antithesis(lines[idx_a], lines[idx_b], rule_detail)
+            if not res.get("success", True):
+                # 裁判故障：返回 None，交由上层记录 judge_fail
+                return None
+            scores.append(res.get("score", 0.0))
+
+        if not scores:
+            return None
+        return sum(scores) / len(scores)

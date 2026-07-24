@@ -48,14 +48,18 @@ def check_antithesis(
     result = client.ask_json(prompt)
 
     if "error" in result:
+        # 裁判故障：返回 success=False，分数置 None，避免被误判为模型写得极差
         return {
             "enabled": True,
-            "score": 0.0,  # 失败时不给满分，避免污染
+            "success": False,
+            "score": None,
+            "error_type": result.get("error", "unknown"),
             "detail": f"LLM评估失败: {result.get('error', 'unknown')}",
         }
 
     return {
         "enabled": True,
+        "success": True,
         "score": float(result.get("score", 0.0)),
         "detail": result.get("reason", ""),
     }

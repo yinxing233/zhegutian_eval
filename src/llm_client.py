@@ -40,12 +40,15 @@ class BaseEvalClient(ABC):
         return self._call_api(prompt, response_schema)
 
     def ask_json(self, prompt: str, retries: int = 3) -> Dict[str, Any]:
-        """发送 Prompt 并尝试解析为 JSON，内置重试、清理逻辑、降级重试和降温"""
+        """发送 Prompt 并尝试解析为 JSON，内置重试、清理逻辑、降级重试和降温。
+
+        使用局部温度变量，不修改 self.temperature，避免跨调用状态污染。
+        """
         last_raw = ""
         current_prompt = prompt
-        original_temp = self.temperature
+        temp = self.temperature  # 局部变量，逐级降温但不污染实例状态
         for attempt in range(retries + 1):
-            raw = self.ask(current_prompt)
+            raw = self._call_api(current_prompt, temperature=temp)
 
             if (
                 not raw
@@ -77,10 +80,8 @@ class BaseEvalClient(ABC):
                             '{"score": <0到1之间的浮点数>, "reason": "<一句话中文理由>"}。'
                             "不要输出任何其他内容。\n\n"
                         ) + prompt[-500:]
-                        self.temperature = max(0.0, self.temperature - 0.2)
+                        temp = max(0.0, temp - 0.2)
                     continue
-                # 恢复温度
-                self.temperature = original_temp
                 return {"error": "EMPTY_RESPONSE", "raw": raw}
 
             # 清理 markdown
@@ -98,17 +99,14 @@ class BaseEvalClient(ABC):
             try:
                 result = json.loads(cleaned)
                 result["raw"] = raw
-                self.temperature = original_temp  # 成功后恢复
                 return result
             except json.JSONDecodeError:
                 last_raw = cleaned
                 if attempt < retries:
                     time.sleep(2)
                     continue
-                self.temperature = original_temp
                 return {"error": "JSON_PARSE_FAILED", "raw": raw}
 
-        self.temperature = original_temp
         return {"error": "Max retries exceeded", "raw": last_raw}
 
 
@@ -125,9 +123,11 @@ class GeminiEvalClient(BaseEvalClient):
             raise ValueError("GEMINI_API_KEY 未设置")
         self.client = genai.Client(api_key=api_key)
 
-    def _call_api(self, prompt: str, response_schema: Optional[Dict] = None) -> str:
+    def _call_api(
+        self, prompt: str, response_schema: Optional[Dict] = None, temperature: Optional[float] = None
+    ) -> str:
         config = types.GenerateContentConfig(
-            temperature=self.temperature,
+            temperature=temperature if temperature is not None else self.temperature,
             max_output_tokens=512,
             response_mime_type="application/json" if response_schema else None,
             response_schema=response_schema if response_schema else None,
@@ -159,7 +159,9 @@ class DeepSeekEvalClient(BaseEvalClient):
             base_url="https://api.deepseek.com",
         )
 
-    def _call_api(self, prompt: str, response_schema: Optional[Dict] = None) -> str:
+    def _call_api(
+        self, prompt: str, response_schema: Optional[Dict] = None, temperature: Optional[float] = None
+    ) -> str:
         system_msg = (
             "你是一个严格的 JSON 输出机。"
             "你必须只输出一个合法的 JSON 对象，不能有任何额外的文字、解释、标记或代码块符号。"
@@ -178,7 +180,7 @@ class DeepSeekEvalClient(BaseEvalClient):
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": full_prompt},
                 ],
-                temperature=self.temperature,
+                temperature=temperature if temperature is not None else self.temperature,
                 max_tokens=512,
             )
             if response.choices and response.choices[0].message.content is not None:
@@ -208,7 +210,9 @@ class GLMEvalClient(BaseEvalClient):
             base_url="https://open.bigmodel.cn/api/paas/v4/",
         )
 
-    def _call_api(self, prompt: str, response_schema: Optional[Dict] = None) -> str:
+    def _call_api(
+        self, prompt: str, response_schema: Optional[Dict] = None, temperature: Optional[float] = None
+    ) -> str:
         system_msg = (
             "你是一个严格的 JSON 输出机。"
             "你必须只输出一个合法的 JSON 对象，不能有任何额外的文字、解释、标记或代码块符号。"
@@ -227,7 +231,7 @@ class GLMEvalClient(BaseEvalClient):
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": full_prompt},
                 ],
-                temperature=self.temperature,
+                temperature=temperature if temperature is not None else self.temperature,
                 max_tokens=512,
             )
             if response.choices and response.choices[0].message.content is not None:
@@ -242,16 +246,24 @@ class GLMEvalClient(BaseEvalClient):
 
 
 # ---------- 工厂入口 ----------
+_client_cache: dict = {}
+
+
 class LLMClient:
-    """评测客户端统一入口，根据 EVAL_PROVIDER 返回对应实现"""
+    """评测客户端统一入口，根据 EVAL_PROVIDER 返回对应实现。
+
+    实例按 provider 缓存复用，避免每次评测都重建 API 客户端。
+    """
 
     def __new__(cls, model: Optional[str] = None):
         provider = os.getenv("EVAL_PROVIDER", "gemini").lower()
-        if provider == "gemini":
-            return GeminiEvalClient(model)
-        elif provider == "deepseek":
-            return DeepSeekEvalClient(model)
-        elif provider == "glm":
-            return GLMEvalClient(model)
-        else:
-            raise ValueError(f"不支持的评测 Provider: {provider}")
+        if provider not in _client_cache:
+            if provider == "gemini":
+                _client_cache[provider] = GeminiEvalClient(model)
+            elif provider == "deepseek":
+                _client_cache[provider] = DeepSeekEvalClient(model)
+            elif provider == "glm":
+                _client_cache[provider] = GLMEvalClient(model)
+            else:
+                raise ValueError(f"不支持的评测 Provider: {provider}")
+        return _client_cache[provider]
