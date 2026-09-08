@@ -27,6 +27,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -81,6 +82,42 @@ DEFAULT_PROVIDER_CONFIG = {
 }
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """写同目录临时文件，完成后再公开为正式实验产物。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            delete=False,
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        ) as stream:
+            temp_name = stream.name
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, path)
+        temp_name = None
+    finally:
+        if temp_name:
+            Path(temp_name).unlink(missing_ok=True)
+
+
+def _atomic_write_json(path: Path, value: dict) -> None:
+    _atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def _atomic_write_jsonl(path: Path, records: list[dict]) -> None:
+    _atomic_write_text(
+        path,
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+    )
+
+
 def sanitize_name(name: str) -> str:
     """移除路径非法字符，避免 Windows / Linux 路径崩溃"""
     return re.sub(r"[^a-zA-Z0-9._-]", "-", name)
@@ -88,11 +125,13 @@ def sanitize_name(name: str) -> str:
 
 def normalize_sample(sample: dict) -> dict:
     """将旧格式样本统一升级为新 schema，保证系统内部只有一种格式"""
+    constraints = dict(sample.get("L0_constraints", {}))
+    constraints.setdefault("prosody_profile", "xinyun_14")
     return {
         "task_id": sample.get("task_id") or sample.get("id", "unknown"),
         "L0_surface_prompt": sample.get("L0_surface_prompt")
         or sample.get("prompt", ""),
-        "L0_constraints": sample.get("L0_constraints", {}),
+        "L0_constraints": constraints,
         "L0_difficulty_axes": sample.get("L0_difficulty_axes", {}),
         "L0_task_tags": sample.get("L0_task_tags", []),
         "L1_expected_failure_modes": sample.get("L1_expected_failure_modes", []),
@@ -101,12 +140,12 @@ def normalize_sample(sample: dict) -> dict:
     }
 
 
-def main():
+def main() -> int:
     input_path = PROJECT_ROOT / "data" / "eval_zhegutian.jsonl"
 
     if not input_path.exists():
-        print(f"❌ 输入文件不存在：{input_path}")
-        return
+        print(f"[ERROR] 输入文件不存在：{input_path}")
+        return 2
 
     raw_samples = []
     with open(input_path, "r", encoding="utf-8") as f:
@@ -117,13 +156,15 @@ def main():
 
     # 入口统一 normalize，消除新旧格式混合
     samples = [normalize_sample(s) for s in raw_samples]
-    print(f"📄 加载了 {len(samples)} 条生成提示（已统一 schema）")
+    print(f"[INFO] 加载了 {len(samples)} 条生成提示（已统一 schema）")
 
     gen = create_generator()
     gen_provider = os.getenv("LLM_PROVIDER", "unknown")
     gen_model = gen.model_name
     temperature = gen.temperature
     max_tokens = gen.max_output_tokens
+    top_p = gen.top_p
+    top_k = gen.top_k
     delay = float(os.getenv("API_DELAY_SECONDS", "0"))
 
     # 获取当前 provider 的配置
@@ -131,7 +172,7 @@ def main():
     prompt_suffix = provider_cfg["prompt_suffix"]
     postprocess = provider_cfg["postprocess"]
 
-    print(f"🔧 Provider: {gen_provider} | suffix: {prompt_suffix.strip()}")
+    print(f"[INFO] Provider: {gen_provider} | suffix: {prompt_suffix.strip()}")
 
     # ----- 构建实验运行目录与唯一 ID -----
     runs_base = PROJECT_ROOT / "runs"
@@ -181,19 +222,30 @@ def main():
 
     metadata = {
         "run_id": run_id,
+        "status": "running",
         "timestamp": datetime.now().isoformat(),
         "gen_model": gen_model,
         "gen_provider": gen_provider,
         "judge_model": judge_model,
         "judge_provider": judge_provider,
         "prompt_version": "v4-provider-adapter",
+        "prompt_adapter": f"{gen_provider.lower()}-v1",
+        "temperature": temperature,
+        "max_output_tokens": max_tokens,
+        "top_p": top_p,
+        "top_k": top_k,
         "git_commit": git_commit,
         "parent_run": None,
         "description": "",
         "task_dataset_hash": task_dataset_hash,
+        "prosody_profiles": sorted(
+            {
+                sample["L0_constraints"]["prosody_profile"]
+                for sample in samples
+            }
+        ),
     }
-    with open(run_dir / "run_metadata.json", "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(run_dir / "run_metadata.json", metadata)
 
     # ----- 逐条生成 -----
     batch_run_id = run_id
@@ -206,7 +258,7 @@ def main():
 
         # Provider 自适应 prompt
         full_prompt = surface_prompt + prompt_suffix
-        print(f"⚙️ [{idx + 1}/{len(samples)}] 生成 {task_id} ...")
+        print(f"[INFO] [{idx + 1}/{len(samples)}] 生成 {task_id} ...")
 
         raw_output = gen.generate(full_prompt)
 
@@ -229,8 +281,13 @@ def main():
             "provider": gen_provider,
             "temperature": temperature,
             "max_output_tokens": max_tokens,
+            "top_p": top_p,
+            "top_k": top_k,
+            "generation_prompt": full_prompt,
+            "prompt_adapter": f"{gen_provider.lower()}-v1",
             # 生成结果
             "raw_output": raw_output,
+            "provider_raw_response": getattr(gen, "last_raw_response", None),
             "generated": ci_text,
             "finish_reason": finish_reason,
             # 内容来源追踪
@@ -250,22 +307,24 @@ def main():
             time.sleep(delay)
 
     # 写入生成结果
-    with open(output_path, "w", encoding="utf-8") as f:
-        for record in results:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    _atomic_write_jsonl(output_path, results)
 
     # ----- 冻结本次使用的任务集快照（输入快照，关键用于 ΔS 分析）-----
     task_snapshot_path = run_dir / "task_snapshot.jsonl"
-    with open(task_snapshot_path, "w", encoding="utf-8") as f:
-        for sample in samples:
-            f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+    _atomic_write_jsonl(task_snapshot_path, samples)
 
-    print(f"\n✅ 生成完毕，共 {len(results)} 条")
+    # generated_results 与 task_snapshot 均完成后，run 才成为可评测快照。
+    metadata["status"] = "completed"
+    metadata["completed_at"] = datetime.now().isoformat()
+    _atomic_write_json(run_dir / "run_metadata.json", metadata)
+
+    print(f"\n[OK] 生成完毕，共 {len(results)} 条")
     print(f"   run_id: {run_id}")
     print(f"   结果已保存至 {output_path}")
     print(f"   任务集快照已保存至 {task_snapshot_path}")
     print(f"   实验目录: {run_dir}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

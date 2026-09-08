@@ -3,7 +3,8 @@
   "variant": "正体（晏几道体）",
   "total_chars": 55,
   "source": "《钦定词谱》卷十",
-  "rhyme_book": "现代拼音（中华新韵十八韵）",
+  "rhyme_book": "中华新韵（十四韵）",
+  "prosody_profile": "xinyun_14",
   "symbol_def": {
     "平": "现代汉语一声（阴平）、二声（阳平）",
     "仄": "现代汉语三声（上声）、四声（去声）",

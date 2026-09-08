@@ -17,6 +17,15 @@ from openai import OpenAI
 
 load_dotenv()
 
+JUDGE_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "number", "minimum": 0, "maximum": 1},
+        "reason": {"type": "string"},
+    },
+    "required": ["score", "reason"],
+}
+
 
 class BaseEvalClient(ABC):
     """评测客户端抽象基类"""
@@ -31,7 +40,12 @@ class BaseEvalClient(ABC):
         pass
 
     @abstractmethod
-    def _call_api(self, prompt: str, response_schema: Optional[Dict] = None) -> str:
+    def _call_api(
+        self,
+        prompt: str,
+        response_schema: Optional[Dict] = None,
+        temperature: Optional[float] = None,
+    ) -> str:
         """各 Provider 实现具体的 API 调用，返回原始文本"""
         pass
 
@@ -48,7 +62,11 @@ class BaseEvalClient(ABC):
         current_prompt = prompt
         temp = self.temperature  # 局部变量，逐级降温但不污染实例状态
         for attempt in range(retries + 1):
-            raw = self._call_api(current_prompt, temperature=temp)
+            raw = self._call_api(
+                current_prompt,
+                response_schema=JUDGE_RESPONSE_SCHEMA,
+                temperature=temp,
+            )
 
             if (
                 not raw
@@ -114,7 +132,10 @@ class BaseEvalClient(ABC):
 class GeminiEvalClient(BaseEvalClient):
     @staticmethod
     def default_model() -> str:
-        return os.getenv("EVAL_MODEL", "gemini-2.0-flash")
+        model = os.getenv("EVAL_MODEL")
+        if not model:
+            raise ValueError("EVAL_MODEL 未设置；实验运行必须显式冻结裁判模型名")
+        return model
 
     def __init__(self, model: Optional[str] = None):
         super().__init__(model)
@@ -147,7 +168,10 @@ class GeminiEvalClient(BaseEvalClient):
 class DeepSeekEvalClient(BaseEvalClient):
     @staticmethod
     def default_model() -> str:
-        return os.getenv("EVAL_MODEL", "deepseek-chat")
+        model = os.getenv("EVAL_MODEL")
+        if not model:
+            raise ValueError("EVAL_MODEL 未设置；实验运行必须显式冻结裁判模型名")
+        return model
 
     def __init__(self, model: Optional[str] = None):
         super().__init__(model)
@@ -198,7 +222,10 @@ class DeepSeekEvalClient(BaseEvalClient):
 class GLMEvalClient(BaseEvalClient):
     @staticmethod
     def default_model() -> str:
-        return os.getenv("EVAL_MODEL", "glm-4-flash")
+        model = os.getenv("EVAL_MODEL")
+        if not model:
+            raise ValueError("EVAL_MODEL 未设置；实验运行必须显式冻结裁判模型名")
+        return model
 
     def __init__(self, model: Optional[str] = None):
         super().__init__(model)
@@ -246,24 +273,27 @@ class GLMEvalClient(BaseEvalClient):
 
 
 # ---------- 工厂入口 ----------
-_client_cache: dict = {}
+_client_cache: dict[tuple[str, str], BaseEvalClient] = {}
 
 
-class LLMClient:
-    """评测客户端统一入口，根据 EVAL_PROVIDER 返回对应实现。
+def create_eval_client(model: Optional[str] = None) -> BaseEvalClient:
+    """按 ``(provider, model)`` 创建并缓存评测客户端。"""
+    provider = os.getenv("EVAL_PROVIDER", "gemini").lower()
+    implementations = {
+        "gemini": GeminiEvalClient,
+        "deepseek": DeepSeekEvalClient,
+        "glm": GLMEvalClient,
+    }
+    client_type = implementations.get(provider)
+    if client_type is None:
+        raise ValueError(f"不支持的评测 Provider: {provider}")
+    resolved_model = model or client_type.default_model()
+    cache_key = (provider, resolved_model)
+    if cache_key not in _client_cache:
+        _client_cache[cache_key] = client_type(resolved_model)
+    return _client_cache[cache_key]
 
-    实例按 provider 缓存复用，避免每次评测都重建 API 客户端。
-    """
 
-    def __new__(cls, model: Optional[str] = None):
-        provider = os.getenv("EVAL_PROVIDER", "gemini").lower()
-        if provider not in _client_cache:
-            if provider == "gemini":
-                _client_cache[provider] = GeminiEvalClient(model)
-            elif provider == "deepseek":
-                _client_cache[provider] = DeepSeekEvalClient(model)
-            elif provider == "glm":
-                _client_cache[provider] = GLMEvalClient(model)
-            else:
-                raise ValueError(f"不支持的评测 Provider: {provider}")
-        return _client_cache[provider]
+def LLMClient(model: Optional[str] = None) -> BaseEvalClient:
+    """兼容旧调用名；新代码优先使用 :func:`create_eval_client`。"""
+    return create_eval_client(model)

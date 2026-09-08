@@ -28,7 +28,17 @@ ANTITHESIS_PROMPT = """你是一位严格的诗词格律质检员，专门挑出
 def check_antithesis(
     line_a: str, line_b: str, rule_antithesis: Optional[Mapping[str, Any]] = None
 ) -> Dict[str, Any]:
-    client = LLMClient()
+    try:
+        client = LLMClient()
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "success": False,
+            "score": None,
+            "error_type": "client_init_failed",
+            "detail": f"LLM 客户端初始化失败: {exc}",
+            "raw": "",
+        }
 
     # 动态组装对仗约束要求，使 LLM 裁判能够感知具体的对仗约束要求
     extra_instructions = ""
@@ -55,11 +65,34 @@ def check_antithesis(
             "score": None,
             "error_type": result.get("error", "unknown"),
             "detail": f"LLM评估失败: {result.get('error', 'unknown')}",
+            "raw": result.get("raw", ""),
+        }
+
+    try:
+        score = float(result["score"])
+    except (KeyError, TypeError, ValueError):
+        return {
+            "enabled": True,
+            "success": False,
+            "score": None,
+            "error_type": "invalid_score",
+            "detail": "LLM 返回的 score 缺失或不是数值",
+            "raw": result.get("raw", ""),
+        }
+    if not 0.0 <= score <= 1.0:
+        return {
+            "enabled": True,
+            "success": False,
+            "score": None,
+            "error_type": "score_out_of_range",
+            "detail": f"LLM 返回的 score 超出 [0, 1]: {score}",
+            "raw": result.get("raw", ""),
         }
 
     return {
         "enabled": True,
         "success": True,
-        "score": float(result.get("score", 0.0)),
+        "score": score,
         "detail": result.get("reason", ""),
+        "raw": result.get("raw", ""),
     }

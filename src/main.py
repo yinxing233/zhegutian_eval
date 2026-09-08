@@ -12,7 +12,7 @@ from src.schema.rule_config import load_rule_config
 
 
 def main():
-    rule = load_rule_config("rules/zhegutian_zhengti.json")
+    rule = load_rule_config(PROJECT_ROOT / "rules" / "zhegutian_zhengti.json")
 
     print("=== 基本信息 ===")
     print(rule.cipai)

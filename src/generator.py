@@ -368,7 +368,9 @@ def create_generator(
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY 未设置")
-        model_name = model or os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+        model_name = model or os.getenv("GEMINI_MODEL")
+        if not model_name:
+            raise ValueError("GEMINI_MODEL 未设置；实验运行必须显式冻结模型名")
         return GeminiGenerator(
             api_key, model_name, temperature, max_output_tokens, top_p, top_k
         )
@@ -377,7 +379,9 @@ def create_generator(
         api_key = os.getenv("DEEPSEEK_API_KEY")
         if not api_key:
             raise ValueError("DEEPSEEK_API_KEY 未设置")
-        model_name = model or os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+        model_name = model or os.getenv("DEEPSEEK_MODEL")
+        if not model_name:
+            raise ValueError("DEEPSEEK_MODEL 未设置；实验运行必须显式冻结模型名")
         return DeepSeekGenerator(
             api_key, model_name, temperature, max_output_tokens, top_p, top_k
         )
@@ -386,7 +390,9 @@ def create_generator(
         api_key = os.getenv("GLM_API_KEY")
         if not api_key:
             raise ValueError("GLM_API_KEY 未设置")
-        model_name = model or os.getenv("GLM_MODEL", "glm-4.5-air")
+        model_name = model or os.getenv("GLM_MODEL")
+        if not model_name:
+            raise ValueError("GLM_MODEL 未设置；实验运行必须显式冻结模型名")
         return GLMGenerator(
             api_key, model_name, temperature, max_output_tokens, top_p, top_k
         )

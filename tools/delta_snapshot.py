@@ -10,8 +10,24 @@ from collections import Counter
 from pathlib import Path
 
 
+def resolve_eval_dir(path: Path) -> Path:
+    """兼容 legacy run 根目录与 v0.3+ 的版本化 evaluations 目录。"""
+    if (path / "eval_results.jsonl").exists():
+        return path
+    evaluations = path / "evaluations"
+    if evaluations.is_dir():
+        candidates = [
+            item
+            for item in evaluations.iterdir()
+            if item.is_dir() and (item / "eval_results.jsonl").exists()
+        ]
+        if candidates:
+            return max(candidates, key=lambda item: item.stat().st_mtime)
+    raise FileNotFoundError(f"在 {path} 中找不到评测结果")
+
+
 def load_eval_results(run_dir: Path) -> list:
-    path = run_dir / "eval_results.jsonl"
+    path = resolve_eval_dir(run_dir) / "eval_results.jsonl"
     if not path.exists():
         raise FileNotFoundError(f"找不到 {path}")
     results = []
@@ -24,11 +40,19 @@ def load_eval_results(run_dir: Path) -> list:
 
 
 def load_metadata(run_dir: Path) -> dict:
-    path = run_dir / "run_metadata.json"
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    metadata = {}
+    run_path = run_dir / "run_metadata.json"
+    if run_path.exists():
+        with open(run_path, "r", encoding="utf-8") as f:
+            metadata.update(json.load(f))
+    try:
+        eval_path = resolve_eval_dir(run_dir) / "eval_metadata.json"
+    except FileNotFoundError:
+        eval_path = None
+    if eval_path and eval_path.exists():
+        with open(eval_path, "r", encoding="utf-8") as f:
+            metadata.update(json.load(f))
+    return metadata
 
 
 def extract_failure_modes(results: list) -> Counter:
@@ -75,6 +99,10 @@ def main():
         "judge_provider"
     ) != meta_b.get("judge_provider"):
         delta_sources.append("ΔD_eval")
+    if meta_a.get("evaluator_sha256") != meta_b.get("evaluator_sha256"):
+        delta_sources.append("ΔD_evaluator")
+    if meta_a.get("prosody_profiles") != meta_b.get("prosody_profiles"):
+        delta_sources.append("ΔD_prosody")
     if meta_a.get("task_dataset_hash") != meta_b.get("task_dataset_hash"):
         delta_sources.append("ΔD_task")
     if not delta_sources:
@@ -97,7 +125,7 @@ def main():
         print(f"{mode:<35} {count_a:>8} {count_b:>8} {delta_str:>8}")
 
     # 简短解读
-    print("\n📋 漂移解读：")
+    print("\n漂移解读：")
     increased = [
         (m, modes_b[m] - modes_a[m])
         for m in all_modes
@@ -110,15 +138,15 @@ def main():
     ]
 
     if increased:
-        print("  ⬆️ 上升的失败模式：")
+        print("  [UP] 上升的失败模式：")
         for mode, delta in increased:
             print(f"     - {mode}: +{delta}")
     if decreased:
-        print("  ⬇️ 下降的失败模式：")
+        print("  [DOWN] 下降的失败模式：")
         for mode, delta in decreased:
             print(f"     - {mode}: -{delta}")
     if not increased and not decreased:
-        print("  ➡️ 失败模式分布无显著变化")
+        print("  [SAME] 失败模式分布无显著变化")
 
 
 if __name__ == "__main__":

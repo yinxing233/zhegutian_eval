@@ -8,10 +8,21 @@ from typing import Any, Dict, List, Optional
 
 from src.metrics.antithesis import check_antithesis
 from src.metrics.pingze import check_line
-from src.metrics.rhyme import check_rhyme, get_yunbu, load_yunbu_table
+from src.metrics.rhyme import check_rhyme
 from src.metrics.semantic import check_semantic
+from src.prosody import ProsodyProfile, load_prosody_profile
 from src.schema.rule_config import RuleConfig
 from utils.text_utils import split_into_lines
+
+
+EVAL_VERSION = "v0.3.0"
+DIMENSION_MAX = {
+    "structure": 10,
+    "pingze": 30,
+    "rhyme": 20,
+    "antithesis": 20,
+    "semantic": 20,
+}
 
 
 def _object_to_dict(obj) -> Optional[Dict[str, Any]]:
@@ -35,7 +46,18 @@ class Evaluator:
         self.rule_lines = []
         for stanza in rule_config.stanzas:
             self.rule_lines.extend(stanza.lines)
-        self.yunbu_table = load_yunbu_table()
+        self.default_prosody = load_prosody_profile(rule_config.prosody_profile)
+
+    def _resolve_prosody(
+        self, constraints: Optional[Dict[str, Any]] = None
+    ) -> ProsodyProfile:
+        constraints = constraints or {}
+        requested = constraints.get("prosody_profile") or constraints.get(
+            "rhyme_system"
+        )
+        if not requested:
+            return self.default_prosody
+        return load_prosody_profile(requested)
 
     def evaluate(
         self,
@@ -53,6 +75,15 @@ class Evaluator:
         :param constraints: 任务约束字典，包含 rhyme_bu（限定韵部）、required_words（必含词）等
         :return: 结构化评分结果
         """
+        prosody = self._resolve_prosody(constraints)
+        requested_rhyme_bu = (constraints or {}).get("rhyme_bu")
+        if requested_rhyme_bu and requested_rhyme_bu not in set(
+            prosody.rhyme_groups.values()
+        ):
+            raise ValueError(
+                f"音韵 profile {prosody.profile_id} 中不存在韵部：{requested_rhyme_bu}"
+            )
+
         # 1. 预处理
         lines = split_into_lines(ci_text)
 
@@ -66,7 +97,7 @@ class Evaluator:
         for i, (line, rl) in enumerate(zip(lines, self.rule_lines)):
             tpl = rl.text_tpl
             strict = rl.strict_positions
-            res = check_line(line, tpl, strict)
+            res = check_line(line, tpl, strict, is_ping_fn=prosody.is_ping)
             res["sentence_index"] = i + 1
             res["line_text"] = line
             pingze_results.append(res)
@@ -76,7 +107,12 @@ class Evaluator:
         for i, (line, rl) in enumerate(zip(lines, self.rule_lines)):
             if rl.rhyme:
                 rhyme_chars.append(line[-1] if line else "")
-        rhyme_result = check_rhyme(rhyme_chars, self.yunbu_table)
+        expected_rhyme_count = sum(1 for rl in self.rule_lines if rl.rhyme)
+        rhyme_result = check_rhyme(
+            rhyme_chars,
+            prosody.rhyme_groups,
+            expected_count=expected_rhyme_count,
+        )
 
         # 5. 对仗检查（LLM-based，可跳过以节省评测配额）
         antithesis_results = []
@@ -85,6 +121,9 @@ class Evaluator:
                 idx_a, idx_b, rule_detail = item
                 res = check_antithesis(lines[idx_a], lines[idx_b], rule_detail)
                 res["sentence_pair"] = [idx_a + 1, idx_b + 1]
+                res["rule_weight"] = (
+                    float(rule_detail.get("weight", 1.0)) if rule_detail else 1.0
+                )
                 antithesis_results.append(res)
 
         # 6. 语义检查（可根据开关跳过）
@@ -109,37 +148,48 @@ class Evaluator:
         )
         scores = overall["breakdown"]
 
-        # 8. 应用任务约束扣分（如果提供了 constraints）
+        constraint_violations = []
+
+        # 8. 应用可执行的 L0 任务约束
         if constraints:
             # 8.1 限定韵部检查
             rhyme_bu = constraints.get("rhyme_bu")
             if rhyme_bu and rhyme_chars:
                 violation_count = 0
                 for char in rhyme_chars:
-                    if char and get_yunbu(char, self.yunbu_table) != rhyme_bu:
+                    actual_group = prosody.get_rhyme_group(char)
+                    if char and actual_group != rhyme_bu:
                         violation_count += 1
+                        constraint_violations.append(
+                            {
+                                "type": "rhyme_bu_mismatch",
+                                "char": char,
+                                "expected": rhyme_bu,
+                                "actual": actual_group,
+                            }
+                        )
                 # 每个违规韵脚扣 3 分，上限扣完韵部分
                 scores["rhyme"] = max(0.0, scores["rhyme"] - violation_count * 3)
 
-            # 8.2 必含词检查（仅在语义已评测时扣分；跳过/未评测时记录缺失原因）
+            # 8.2 必含词是确定性约束：始终检查；语义维度存在时再执行扣分
             required_words = constraints.get("required_words", [])
             if required_words:
                 missing = [w for w in required_words if w not in ci_text]
                 if missing:
+                    constraint_violations.append(
+                        {
+                            "type": "missing_required_words",
+                            "words": missing,
+                        }
+                    )
                     if "semantic" in scores:
                         scores["semantic"] = max(0.0, scores["semantic"] - len(missing) * 5)
-                    else:
-                        semantic_missing_reason = (
-                            f"missing_required_words:{','.join(missing)}"
-                        )
 
             # 重新计算总分
             overall["total"] = round(sum(scores.values()), 2)
             overall["breakdown"] = scores
 
-        # 判断语义是否真正被评测（非跳过、非裁判失败）
-        semantic_evaluated = False
-        semantic_missing_reason = None
+        # 判断各 LLM 维度是否真正被评测（非跳过、非裁判失败）
         if skip_semantic:
             semantic_evaluated = False
             semantic_missing_reason = "skip_semantic"
@@ -150,8 +200,54 @@ class Evaluator:
             )
         else:
             semantic_evaluated = True
+            semantic_missing_reason = None
 
-        # 9. 收集 failure_trace (时序崩塌追踪)
+        dimension_status = {
+            "structure": "valid",
+            "pingze": "valid",
+            "rhyme": "valid",
+        }
+        antithesis_pairs = self._collect_antithesis_pairs(lines)
+        if skip_antithesis:
+            dimension_status["antithesis"] = "rule_skip"
+        elif not antithesis_pairs:
+            dimension_status["antithesis"] = "structural_unavailable"
+        else:
+            valid_anti = [
+                r
+                for r in antithesis_results
+                if r.get("success") and r.get("score") is not None
+            ]
+            if len(valid_anti) == len(antithesis_results):
+                dimension_status["antithesis"] = "valid"
+            elif valid_anti:
+                dimension_status["antithesis"] = "partial_judge_fail"
+            else:
+                dimension_status["antithesis"] = "judge_fail"
+
+        if semantic_evaluated:
+            dimension_status["semantic"] = "valid"
+        elif skip_semantic:
+            dimension_status["semantic"] = "rule_skip"
+        else:
+            dimension_status["semantic"] = "judge_fail"
+
+        missing_reason = {
+            name: status
+            for name, status in dimension_status.items()
+            if status != "valid"
+        }
+        valid_scores = overall["breakdown"]
+        available_score = sum(DIMENSION_MAX[name] for name in valid_scores)
+        overall["available_score"] = available_score
+        overall["coverage"] = round(len(valid_scores) / len(DIMENSION_MAX), 2)
+        overall["normalized_score"] = (
+            round(overall["total"] / available_score * 100, 2)
+            if available_score
+            else 0.0
+        )
+
+        # 9. 收集 failure_trace（评测顺序中的观测证据，不代表 token 时间序列）
         failure_trace = []
 
         # 9.1 结构不完整
@@ -188,7 +284,8 @@ class Evaluator:
 
         # 9.4 对仗错误
         for r in antithesis_results:
-            if r.get("score", 1.0) < 0.8:  # 设定对仗不工整阈值
+            score = r.get("score")
+            if score is not None and score < 0.8:  # 设定对仗不工整阈值
                 pair = r.get("sentence_pair", [])
                 failure_trace.append(
                     {
@@ -199,7 +296,19 @@ class Evaluator:
                     }
                 )
 
+        for violation in constraint_violations:
+            failure_trace.append(
+                {
+                    "step": len(failure_trace) + 1,
+                    "type": "constraint_violation",
+                    "detail": violation,
+                }
+            )
+
         return {
+            "eval_version": EVAL_VERSION,
+            "prosody_profile": prosody.profile_id,
+            "prosody_display_name": prosody.display_name,
             "structure_ok": structure_ok,
             "expected_lines": expected_count,
             "actual_lines": actual_count,
@@ -209,13 +318,62 @@ class Evaluator:
             "semantic": semantic_result,
             "semantic_evaluated": semantic_evaluated,
             "semantic_missing_reason": semantic_missing_reason,
+            "dimension_status": dimension_status,
+            "missing_dimensions": list(missing_reason),
+            "missing_reason": missing_reason or None,
+            "constraint_violations": constraint_violations,
             "overall": overall,
             "failure_trace": failure_trace,
         }
 
+    def evaluate_conditional(
+        self,
+        ci_text: str,
+        prompt_context: str = "",
+        constraints: Optional[Dict[str, Any]] = None,
+        structure_rhyme_threshold_ratio: float = 0.8,
+        min_pingze_for_llm: float = 20.0,
+        enable_llm: bool = True,
+    ) -> Dict[str, Any]:
+        """唯一的条件式评测入口：先规则筛选，再按需调用 LLM 裁判。"""
+        rule_only = self.evaluate(
+            ci_text,
+            prompt_context=prompt_context,
+            skip_semantic=True,
+            skip_antithesis=True,
+            constraints=constraints,
+        )
+        scores = rule_only["overall"]["breakdown"]
+        do_llm = enable_llm and (
+            scores["structure"] >= DIMENSION_MAX["structure"] * structure_rhyme_threshold_ratio
+            and scores["rhyme"] >= DIMENSION_MAX["rhyme"] * structure_rhyme_threshold_ratio
+            and scores["pingze"] >= min_pingze_for_llm
+        )
+        if not do_llm:
+            rule_only["llm_evaluation_triggered"] = False
+            # 条件未通过不是用户主动 skip，使用更精确的缺失原因。
+            if enable_llm:
+                for name in ("antithesis", "semantic"):
+                    rule_only["dimension_status"][name] = "rule_skip"
+                rule_only["missing_reason"] = {
+                    "antithesis": "rule_skip",
+                    "semantic": "rule_skip",
+                }
+            return rule_only
+
+        result = self.evaluate(
+            ci_text,
+            prompt_context=prompt_context,
+            skip_semantic=False,
+            skip_antithesis=False,
+            constraints=constraints,
+        )
+        result["llm_evaluation_triggered"] = True
+        return result
+
     @staticmethod
     def infer_instability_pattern(
-        metrics: Dict[str, float],
+        metrics: Dict[str, Optional[float]],
         generated: str = "",
         finish_reason: str = "",
         reasoning_content: Optional[str] = None,
@@ -226,11 +384,12 @@ class Evaluator:
         primary_field 取值：M_ONLY, F_imagery, F_emotional, NONE（永不缺失）
         """
         tags: List[Dict[str, str]] = []
+        finish_reason = Evaluator.normalize_finish_reason(finish_reason)
 
         # ---------- 1. 纯 M 层症状（primary_field = "M_ONLY"） ----------
 
         # reasoning_overflow：推理链过长
-        if finish_reason in ("length", "MAX_TOKENS") and reasoning_content:
+        if finish_reason == "length" and reasoning_content:
             gen_len = len(generated) if generated else 0
             if len(reasoning_content) > max(100, gen_len * 2):
                 tags.append(
@@ -261,20 +420,17 @@ class Evaluator:
         # ---------- 2. 深层诊断（需要 semantic 分数） ----------
         semantic = metrics.get("semantic")
         if semantic is None:
-            if not tags:
-                tags.append({"symptom": "unknown_instability", "primary_field": "NONE"})
             return tags
 
         pingze = metrics.get("pingze") or 0
         rhyme = metrics.get("rhyme") or 0
-        antithesis = metrics.get("antithesis") or 0
-
-        # template_parroting：格律稳定但语义空洞 → F_imagery
+        # 代理规则保持互斥：证据不足时只保留一个主导失稳方向。
+        # template_parroting：格律与押韵稳定但语义空洞 → F_imagery
         if pingze >= 25 and rhyme >= 18 and semantic <= 8:
             tags.append({"symptom": "template_parroting", "primary_field": "F_imagery"})
 
-        # aesthetic_entropy：平仄正常但语义极低 → F_emotional
-        if pingze >= 25 and semantic <= 8:
+        # aesthetic_entropy：平仄尚稳、押韵已失守且语义极低 → F_emotional
+        elif pingze >= 25 and semantic <= 8:
             tags.append(
                 {"symptom": "aesthetic_entropy", "primary_field": "F_emotional"}
             )
@@ -290,15 +446,24 @@ class Evaluator:
             and semantic <= 5
             and pingze < 20
             and len(generated.strip()) > 0
-            and generated.count("\n") >= 1  # 至少 2 句（一句 + 至少一个换行）
+            and len(split_into_lines(generated)) >= 2
         ):
             tags.append({"symptom": "fragmentation", "primary_field": "NONE"})
 
-        # ---------- 4. 兜底 ----------
-        if not tags:
-            tags.append({"symptom": "unknown_instability", "primary_field": "NONE"})
-
         return tags
+
+    @staticmethod
+    def normalize_finish_reason(finish_reason: str) -> str:
+        """统一不同 provider 的完成原因，供诊断与 badcase 共用。"""
+        raw = str(finish_reason or "unknown").strip()
+        upper = raw.upper()
+        if upper == "LENGTH" or upper.endswith("MAX_TOKENS"):
+            return "length"
+        if upper in {"STOP", "STOPPED", "FINISH_REASON.STOP"}:
+            return "stop"
+        if upper in {"EXCEPTION", "NO_CHOICES", "NO_CANDIDATES"}:
+            return upper.lower()
+        return raw.lower()
 
     def _compute_overall(
         self,
@@ -327,33 +492,30 @@ class Evaluator:
         else:
             scores["pingze"] = 0.0
 
-        # 押韵（20分）
+        # 押韵（20分）；不完整和未知韵脚按期望韵脚数折损
         if rhyme_result["rhyme_ok"]:
             scores["rhyme"] = 20.0
         else:
-            first_yunbu = (
-                rhyme_result["char_yunbu"][0] if rhyme_result["char_yunbu"] else None
+            expected = rhyme_result.get("expected_count") or 0
+            dominant = rhyme_result.get("dominant_count", 0)
+            scores["rhyme"] = (
+                round(20.0 * dominant / expected, 2) if expected else 0.0
             )
-            if first_yunbu and first_yunbu != "未知":
-                same_count = sum(
-                    1 for y in rhyme_result["char_yunbu"] if y == first_yunbu
-                )
-                scores["rhyme"] = round(
-                    20.0 * (same_count / len(rhyme_result["char_yunbu"])), 2
-                )
-            else:
-                scores["rhyme"] = 0.0
 
         # 对仗（20分）：仅在真正评测时计入
         if antithesis_results is not None:
-            if antithesis_results:
-                avg_anti = sum(r["score"] for r in antithesis_results) / len(
-                    antithesis_results
-                )
+            valid_anti = [
+                r
+                for r in antithesis_results
+                if r.get("success") and r.get("score") is not None
+            ]
+            if valid_anti and len(valid_anti) == len(antithesis_results):
+                weight_total = sum(r.get("rule_weight", 1.0) for r in valid_anti)
+                avg_anti = sum(
+                    r["score"] * r.get("rule_weight", 1.0) for r in valid_anti
+                ) / weight_total
                 scores["antithesis"] = round(avg_anti * 20, 2)
-            else:
-                # 结构破碎到无法成对：不给满分，记 0 分
-                scores["antithesis"] = 0.0
+            # 没有可用句对或裁判全部失败时，该维度缺失，不伪造 0 分。
 
         # 语义（20分）：None 表示未评测（跳过或裁判故障），不计入
         sem_score = semantic_result.get("score")
@@ -433,14 +595,16 @@ class Evaluator:
         if not pairs:
             return None
 
-        scores = []
+        weighted_scores = []
         for idx_a, idx_b, rule_detail in pairs:
             res = check_antithesis(lines[idx_a], lines[idx_b], rule_detail)
             if not res.get("success", True):
                 # 裁判故障：返回 None，交由上层记录 judge_fail
                 return None
-            scores.append(res.get("score", 0.0))
+            weight = float(rule_detail.get("weight", 1.0)) if rule_detail else 1.0
+            weighted_scores.append((res.get("score", 0.0), weight))
 
-        if not scores:
+        if not weighted_scores:
             return None
-        return sum(scores) / len(scores)
+        total_weight = sum(weight for _, weight in weighted_scores)
+        return sum(score * weight for score, weight in weighted_scores) / total_weight

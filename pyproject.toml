@@ -1,6 +1,6 @@
 [project]
 name = "zhegutian-eval"
-version = "0.1.0"
+version = "0.2.0"
 description = "鹧鸪天评测集"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -14,10 +14,15 @@ dependencies = [
 ]
 
 [project.scripts]
-zhegutian = "main:main"
+zhegutian = "src.main:main"
 
-[tool.setuptools]
-package-dir = {"" = "src"}
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+package = true
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["src*", "utils*", "tools*"]

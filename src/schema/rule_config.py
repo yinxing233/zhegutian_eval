@@ -171,6 +171,11 @@ class RuleConfig(BaseModel):
         description="使用的韵书，例如：词林正韵"
     )
 
+    prosody_profile: str = Field(
+        "xinyun_14",
+        description="音韵算法与数据版本；MVP 当前仅支持 xinyun_14",
+    )
+
     symbol_def: dict = Field(
         ...,
         description="平仄符号定义（平 / 仄 / 中 的解释）"
@@ -205,4 +210,18 @@ def load_rule_config(path: str | Path) -> RuleConfig:
     # - 字段是否存在
     # - 类型是否正确
     # - 嵌套结构是否匹配
-    return RuleConfig(**data)
+    rule = RuleConfig(**data)
+
+    all_lines = [line for stanza in rule.stanzas for line in stanza.lines]
+    if sum(line.char_count for line in all_lines) != rule.total_chars:
+        raise ValueError("规则声明的 total_chars 与逐句字数之和不一致")
+    if any(len(line.text_tpl) != line.char_count for line in all_lines):
+        raise ValueError("存在 text_tpl 长度与 char_count 不一致的句子")
+    expected_indexes = list(range(1, len(all_lines) + 1))
+    if [line.index for line in all_lines] != expected_indexes:
+        raise ValueError("规则句序号必须从 1 开始连续递增")
+    for item in rule.special_rules.antithesis.required + rule.special_rules.antithesis.recommended:
+        if len(item.pair) != 2 or any(i not in expected_indexes for i in item.pair):
+            raise ValueError(f"无效的对仗句对：{item.pair}")
+
+    return rule

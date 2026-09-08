@@ -1,34 +1,23 @@
-"""
-批量评测脚本
-从指定的 run 目录（或最新 run）读取 generated_results.jsonl，逐条评测，
-输出完整实验快照到同一 run 目录下的 eval_results.jsonl，
-同时将 badcase 和 judge 故障写入该 run 目录。
+"""对冻结生成快照执行可版本化、可回放的批量评测。"""
 
-支持命令行参数：
-  python batch_evaluate.py --run run_xxx    # 显式指定 run
-  python batch_evaluate.py                  # 默认使用最新的 run
-
-v3 更新：
-- 使用 runs/ 目录结构，输入输出均落在同一 run 目录内
-- 增加 resolve_run_dir() 支持显式或自动选择 run
-- 与 batch_generate.py 配合，形成完整实验快照
-- 输出格式改为 jsonl
-"""
-
+import argparse
+import hashlib
 import json
 import os
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 PROJECT_ROOT = Path(__file__).parent
-sys.path.insert(0, str(PROJECT_ROOT))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from dotenv import load_dotenv
 
-from src.evaluator import Evaluator
+from src.evaluator import DIMENSION_MAX, EVAL_VERSION, Evaluator
 from src.schema.rule_config import load_rule_config
 
 try:
@@ -41,59 +30,6 @@ except ImportError:
 load_dotenv()
 
 
-def resolve_run_dir(run_id: Optional[str] = None) -> Path:
-    """解析 run 目录。若指定 run_id，使用对应目录；否则自动选择 runs/ 下最新的。"""
-    runs_base = PROJECT_ROOT / "runs"
-    if not runs_base.exists():
-        raise FileNotFoundError("runs/ 目录不存在，请先运行 batch_generate.py")
-
-    if run_id:
-        target = runs_base / run_id
-        if not target.exists():
-            raise FileNotFoundError(f"指定的 run 目录不存在：{target}")
-        return target
-
-    # 默认：按 run_id 名称排序取最新
-    def extract_run_num(p: Path) -> int:
-        try:
-            return int(p.name.split("_")[1])
-        except:
-            return -1
-
-    all_runs = sorted(
-        [d for d in runs_base.iterdir() if d.is_dir() and d.name.startswith("run_")],
-        key=extract_run_num,
-        reverse=True,
-    )
-    if not all_runs:
-        raise FileNotFoundError("runs/ 目录为空")
-    return all_runs[0]
-
-
-def _append_judge_failure(
-    judge_failure_path: Path,
-    task_id: str,
-    judge_model: str,
-    judge_provider: str,
-    error_type: str,
-    raw: str,
-) -> None:
-    """追加一条裁判故障记录（judge failure）。"""
-    judge_failure_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(judge_failure_path, "a", encoding="utf-8") as jf:
-        failure_record = {
-            "timestamp": datetime.now().isoformat(),
-            "task_id": task_id,
-            "judge_model": judge_model,
-            "provider": judge_provider,
-            "error_type": error_type,
-            "raw": raw,
-        }
-        jf.write(json.dumps(failure_record, ensure_ascii=False) + "\n")
-
-
-# 仅这些「硬失败」症状会触发 badcase 标记；
-# safe_mediocrity / unknown_instability 等为信息性标签，不构成 badcase。
 HARD_FAILURES = {
     "reasoning_overflow",
     "empty_output",
@@ -104,296 +40,377 @@ HARD_FAILURES = {
     "template_parroting",
     "aesthetic_entropy",
     "fragmentation",
-    "generation_truncated",
+    "constraint_violation",
 }
 
 
-def main():
-    # 解析命令行参数
-    run_id = None
-    if "--run" in sys.argv:
-        idx = sys.argv.index("--run")
-        if idx + 1 < len(sys.argv):
-            run_id = sys.argv[idx + 1]
+def resolve_run_dir(run_id: Optional[str] = None) -> Path:
+    """解析 run 目录；未指定时选择编号最大的 run。"""
+    runs_base = PROJECT_ROOT / "runs"
+    if not runs_base.exists():
+        raise FileNotFoundError("runs/ 目录不存在，请先运行 batch_generate.py")
 
-    try:
-        run_dir = resolve_run_dir(run_id)
-    except FileNotFoundError as e:
-        print(f"❌ {e}")
-        return
+    if run_id:
+        target = runs_base / run_id
+        if not target.is_dir():
+            raise FileNotFoundError(f"指定的 run 目录不存在：{target}")
+        return target
 
-    generated_file = run_dir / "generated_results.jsonl"
-    if not generated_file.exists():
-        print(f"❌ 在 {run_dir} 中找不到 generated_results.jsonl")
-        return
+    def extract_run_num(path: Path) -> int:
+        try:
+            return int(path.name.split("_")[1])
+        except (IndexError, ValueError):
+            return -1
 
-    output_path = run_dir / "eval_results.jsonl"
-    badcase_path = run_dir / "badcase_pool.jsonl"
-    judge_failure_path = run_dir / "judge_failures.jsonl"
+    runs = [
+        path
+        for path in runs_base.iterdir()
+        if path.is_dir() and path.name.startswith("run_")
+        and (path / "generated_results.jsonl").exists()
+    ]
+    if not runs:
+        raise FileNotFoundError("runs/ 目录为空")
+    return max(runs, key=extract_run_num)
 
-    # 清理旧输出，保证 replay 幂等（避免 badcase / judge_failures 重复累积）
-    for p in (output_path, badcase_path, judge_failure_path):
-        if p.exists():
-            p.unlink()
 
-    print(f"📂 使用运行目录：{run_dir}")
-
+def load_jsonl(path: Path) -> List[Dict[str, Any]]:
     records = []
-    with open(generated_file, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
+    with open(path, "r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            try:
                 records.append(json.loads(line))
-    print(f"📄 读取到 {len(records)} 条生成记录")
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path} 第 {line_number} 行不是合法 JSON") from exc
+    return records
 
-    rule_path = PROJECT_ROOT / "rules" / "zhegutian_zhengti.json"
-    rule = load_rule_config(rule_path)
 
-    STRUCTURE_FULL = 10.0
-    RHYME_FULL = 20.0
-    STRUCTURE_RHYME_THRESHOLD_RATIO = float(
-        os.getenv("STRUCTURE_RHYME_THRESHOLD_RATIO", "0.8")
+def _atomic_write_text(path: Path, content: str) -> None:
+    """在目标目录内写临时文件，成功后原子替换旧产物。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            delete=False,
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        ) as stream:
+            temp_name = stream.name
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, path)
+        temp_name = None
+    finally:
+        if temp_name:
+            Path(temp_name).unlink(missing_ok=True)
+
+
+def atomic_write_jsonl(path: Path, records: Iterable[Dict[str, Any]]) -> None:
+    content = "".join(
+        json.dumps(record, ensure_ascii=False) + "\n" for record in records
     )
-    MIN_PINGZE_FOR_SEMANTIC = float(os.getenv("MIN_PINGZE_FOR_SEMANTIC", "20"))
+    _atomic_write_text(path, content)
 
-    delay = float(os.getenv("API_DELAY_SECONDS", "0"))
 
-    evaluator = Evaluator(rule)
-    judge_model = os.getenv("EVAL_MODEL", "unknown")
-    judge_provider = os.getenv("EVAL_PROVIDER", "unknown")
-    eval_version = "v0.2.2"
+def atomic_write_json(path: Path, value: Dict[str, Any]) -> None:
+    _atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
-    dimension_max = {
-        "structure": 10,
-        "pingze": 30,
-        "rhyme": 20,
-        "antithesis": 20,
-        "semantic": 20,
-    }
 
-    results = []
-    for idx, record in enumerate(records):
-        task_id = record.get("task_id", f"record_{idx}")
-        ci_text = record.get("generated", "")
-        prompt_context = record.get("L0_surface_prompt", "")
-        constraints = record.get("L0_constraints", {})
-        finish_reason = record.get("finish_reason", "UNKNOWN")
+def sha256_files(paths: Iterable[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(paths, key=lambda item: str(item)):
+        digest.update(str(path.relative_to(PROJECT_ROOT)).encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
-        print(f"🔍 [{idx + 1}/{len(records)}] 评测 {task_id} ...")
 
-        # 第一步：纯规则筛选（跳过所有 LLM 评测，先筛后评，节省配额）
-        eval_result = evaluator.evaluate(
-            ci_text,
-            prompt_context=prompt_context,
-            skip_semantic=True,
-            skip_antithesis=True,
-            constraints=constraints,
+def collect_judge_failures(
+    result: Dict[str, Any],
+    task_id: str,
+    judge_model: str,
+    judge_provider: str,
+) -> List[Dict[str, Any]]:
+    failures = []
+    timestamp = datetime.now().isoformat()
+    for item in result.get("antithesis", []):
+        if not item.get("success", False):
+            failures.append(
+                {
+                    "timestamp": timestamp,
+                    "task_id": task_id,
+                    "dimension": "antithesis",
+                    "sentence_pair": item.get("sentence_pair"),
+                    "judge_model": judge_model,
+                    "provider": judge_provider,
+                    "error_type": item.get("error_type", "unknown"),
+                    "raw": item.get("raw", "")[:500],
+                }
+            )
+    semantic = result.get("semantic", {})
+    if result.get("llm_evaluation_triggered") and not semantic.get("success", False):
+        failures.append(
+            {
+                "timestamp": timestamp,
+                "task_id": task_id,
+                "dimension": "semantic",
+                "judge_model": judge_model,
+                "provider": judge_provider,
+                "error_type": semantic.get("error_type", "unknown"),
+                "raw": semantic.get("raw", "")[:500],
+            }
         )
-        breakdown = eval_result["overall"]["breakdown"]
-        structure_score = breakdown["structure"]
-        rhyme_score = breakdown["rhyme"]
-        pingze_score = breakdown["pingze"]
+    return failures
 
-        # 格律通过阈值才触发 LLM 评测（对仗 + 语义）
-        do_llm = (
-            structure_score >= STRUCTURE_FULL * STRUCTURE_RHYME_THRESHOLD_RATIO
-            and rhyme_score >= RHYME_FULL * STRUCTURE_RHYME_THRESHOLD_RATIO
-            and pingze_score > MIN_PINGZE_FOR_SEMANTIC
-        )
 
-        # 初始化评测结果占位对象
-        semantic_result = {
-            "success": False,
-            "score": None,
-            "error_type": "not_evaluated",
-            "raw": "",
-        }
-        antithesis_score = None
-        missing_reason = {}
-        evaluated_dims = ["structure", "pingze", "rhyme"]
+def evaluate_record(
+    evaluator: Evaluator,
+    record: Dict[str, Any],
+    index: int,
+    run_dir: Path,
+    judge_model: str,
+    judge_provider: str,
+    threshold_ratio: float,
+    min_pingze: float,
+    enable_llm: bool,
+) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    task_id = record.get("task_id", f"record_{index}")
+    ci_text = record.get("generated", "")
+    finish_reason_raw = record.get("finish_reason", "unknown")
+    finish_reason = evaluator.normalize_finish_reason(finish_reason_raw)
 
-        if do_llm:
-            print("   → 触发 LLM 评测（对仗 + 语义）")
+    result = evaluator.evaluate_conditional(
+        ci_text,
+        prompt_context=record.get("L0_surface_prompt", ""),
+        constraints=record.get("L0_constraints", {}),
+        structure_rhyme_threshold_ratio=threshold_ratio,
+        min_pingze_for_llm=min_pingze,
+        enable_llm=enable_llm,
+    )
 
-            # 对仗评测
-            antithesis_raw = evaluator.evaluate_antithesis_only(ci_text)
-            if antithesis_raw is not None:
-                antithesis_score = round(antithesis_raw * 20, 2)
-                evaluated_dims.append("antithesis")
-            else:
-                missing_reason["antithesis"] = "judge_fail"
-                _append_judge_failure(
-                    judge_failure_path,
-                    task_id,
-                    judge_model,
-                    judge_provider,
-                    "antithesis_eval_failed",
-                    "",
-                )
-
-            # 语义评测
-            semantic_result = evaluator.evaluate_semantic_only(ci_text, prompt_context)
-            if semantic_result.get("success"):
-                evaluated_dims.append("semantic")
-            else:
-                error_type = semantic_result.get("error_type", "unknown")
-                missing_reason["semantic"] = f"judge_fail:{error_type}"
-                _append_judge_failure(
-                    judge_failure_path,
-                    task_id,
-                    judge_model,
-                    judge_provider,
-                    error_type,
-                    semantic_result.get("raw", "")[:500],
-                )
-        else:
-            missing_reason["antithesis"] = "rule_skip"
-            missing_reason["semantic"] = "rule_skip"
-
-        semantic_score = semantic_result.get("score")
-        if semantic_score is not None:
-            semantic_score = round(semantic_score * 20, 2)
-        semantic_evaluated = semantic_result.get("success", False)
-
-        # 组装指标（未评测维度为 None，由覆盖率处理）
-        metrics = {
-            "structure": structure_score,
-            "pingze": pingze_score,
-            "rhyme": rhyme_score,
-            "antithesis": antithesis_score,
-            "semantic": semantic_score,
-        }
-
-        valid_scores = {k: v for k, v in metrics.items() if v is not None}
-        coverage = len(valid_scores) / len(metrics)
-
-        total_score = round(sum(valid_scores.values()), 2)
-        available_score = sum(dimension_max[k] for k in valid_scores)
-        normalized_score = (
-            round(total_score / available_score * 100, 2) if available_score > 0 else 0
+    breakdown = result["overall"]["breakdown"]
+    metrics = {name: breakdown.get(name) for name in DIMENSION_MAX}
+    instability_tags = evaluator.infer_instability_pattern(
+        metrics,
+        generated=ci_text,
+        finish_reason=finish_reason,
+        reasoning_content=record.get("reasoning_content"),
+    )
+    if result.get("constraint_violations"):
+        instability_tags.append(
+            {"symptom": "constraint_violation", "primary_field": "M_ONLY"}
         )
 
-        # 传入 reasoning_content 诊断 reasoning_overflow
-        reasoning_content = record.get("reasoning_content")
-        error_tags_raw = Evaluator.infer_instability_pattern(
-            metrics, ci_text, finish_reason, reasoning_content
-        )
-        error_category = [tag["symptom"] for tag in error_tags_raw]
+    error_category = list(dict.fromkeys(tag["symptom"] for tag in instability_tags))
+    hard_failures = [name for name in error_category if name in HARD_FAILURES]
+    normalized_score = result["overall"]["normalized_score"]
+    provider_error = ci_text.startswith(("[Error:", "[API Error:"))
+    is_badcase = normalized_score < 60 or bool(hard_failures) or provider_error
 
-        # 追加生成截断标记
-        if (
-            finish_reason == "MAX_TOKENS"
-            and "generation_truncated" not in error_category
-        ):
-            error_category = ["generation_truncated"] + [
-                t for t in error_category if t != "generation_truncated"
-            ]
+    reasons = list(hard_failures)
+    if normalized_score < 60:
+        reasons.append("normalized_score_below_60")
+    if provider_error:
+        reasons.append("provider_error")
 
-        # 仅「硬失败」症状触发 badcase；safe_mediocrity / unknown_instability
-        # 等为信息性标签，不意味着样本是坏案例
-        hard_failures = [t for t in error_category if t in HARD_FAILURES]
-        is_badcase = (
-            normalized_score < 60
-            or len(hard_failures) > 0
-            or ci_text.startswith("[Error:")
-            or ci_text.startswith("[API Error:")
-            or finish_reason == "MAX_TOKENS"
-        )
-        badcase_reason = "; ".join(hard_failures) if hard_failures else ""
-
-        snapshot = {
+    # 从生成快照复制完整因果来源，再叠加当前 evaluator 的解释。
+    snapshot = dict(record)
+    snapshot.update(
+        {
             "batch_run_id": record.get("batch_run_id", run_dir.name),
             "task_id": task_id,
-            "task_sample_id": record.get("task_sample_id", f"{task_id}__eval_{idx}"),
-            "prompt_version": record.get("prompt_version", "unknown"),
-            "model": record.get("model", "unknown"),
-            "provider": record.get("provider", "unknown"),
-            "temperature": record.get("temperature", 0),
-            "max_output_tokens": record.get("max_output_tokens", 0),
+            "task_sample_id": record.get(
+                "task_sample_id", f"{task_id}__eval_{index}"
+            ),
             "judge_model": judge_model,
             "judge_provider": judge_provider,
-            "eval_version": eval_version,
-            "timestamp": datetime.now().isoformat(),
-            "L0_task_tags": record.get("L0_task_tags", []),
-            "L0_difficulty_axes": record.get("L0_difficulty_axes", {}),
-            "L1_expected_failure_modes": record.get("L1_expected_failure_modes", []),
-            "generated": ci_text,
+            "eval_version": EVAL_VERSION,
+            "eval_timestamp": datetime.now().isoformat(),
+            "prosody_profile": result["prosody_profile"],
+            "finish_reason_raw": finish_reason_raw,
             "finish_reason": finish_reason,
             "metrics": metrics,
-            "evaluated_dimensions": evaluated_dims,
-            "coverage": round(coverage, 2),
-            "missing_dimensions": [k for k, v in metrics.items() if v is None],
-            "missing_reason": missing_reason if missing_reason else None,
-            "semantic_evaluated": semantic_evaluated,
-            "total_score": total_score,
-            "available_score": available_score,
+            "dimension_status": result["dimension_status"],
+            "evaluated_dimensions": [
+                name
+                for name, status in result["dimension_status"].items()
+                if status == "valid"
+            ],
+            "coverage": result["overall"]["coverage"],
+            "missing_dimensions": result["missing_dimensions"],
+            "missing_reason": result["missing_reason"],
+            "constraint_violations": result["constraint_violations"],
+            "llm_evaluation_triggered": result["llm_evaluation_triggered"],
+            "total_score": result["overall"]["total"],
+            "available_score": result["overall"]["available_score"],
             "normalized_score": normalized_score,
             "error_category": error_category,
-            "instability_tags": error_tags_raw,  # ← 新增结构化标签
+            "instability_tags": instability_tags,
             "badcase": is_badcase,
-            "badcase_reason": badcase_reason,
-            "semantic_raw": semantic_result.get("raw", "")[:500],
-            "failure_trace": eval_result.get("failure_trace", []),
+            "badcase_reason": "; ".join(dict.fromkeys(reasons)),
+            "semantic_raw": result.get("semantic", {}).get("raw", "")[:500],
+            "failure_trace": result["failure_trace"],
         }
-        results.append(snapshot)
+    )
+    failures = collect_judge_failures(
+        result, task_id, judge_model, judge_provider
+    )
+    return snapshot, failures
 
-        if is_badcase:
-            badcase_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(badcase_path, "a", encoding="utf-8") as bf:
-                bf.write(json.dumps(snapshot, ensure_ascii=False) + "\n")
 
-        if do_semantic and semantic_evaluated and delay > 0:
-            time.sleep(delay)
-
-    # 汇总输出
-    print("\n" + "=" * 60)
-    print("📊 评测汇总")
-    table_data = []
-    for r in results:
-        sem_display = r["metrics"]["semantic"]
-        if sem_display is None:
-            if r.get("missing_reason") and "semantic" in r["missing_reason"]:
-                reason_short = r["missing_reason"]["semantic"]
-                sem_display = f"跳过({reason_short[:12]})"
-            else:
-                sem_display = "未评"
-
-        error_tags = list(r["error_category"]) if r["error_category"] else []
-        finish = r.get("finish_reason", "")
-        if finish == "MAX_TOKENS" and "generation_truncated" not in error_tags:
-            error_tags.insert(0, "generation_truncated")
-
-        norm_display = f"{r['normalized_score']:.1f}"
-        if r["coverage"] < 1.0:
-            norm_display += " ⚠️"
-
-        table_data.append(
+def print_summary(results: List[Dict[str, Any]]) -> None:
+    rows = []
+    for result in results:
+        semantic = result["metrics"]["semantic"]
+        if semantic is None:
+            semantic = f"缺失({result['dimension_status']['semantic']})"
+        rows.append(
             [
-                r["task_id"],
-                norm_display,
-                f"{r['coverage']:.0%}",
-                r["metrics"]["pingze"] if r["metrics"]["pingze"] is not None else "-",
-                r["metrics"]["rhyme"] if r["metrics"]["rhyme"] is not None else "-",
-                sem_display,
-                ", ".join(error_tags) if error_tags else "✅",
-                finish,
+                result["task_id"],
+                f"{result['normalized_score']:.1f}",
+                f"{result['coverage']:.0%}",
+                result["metrics"]["pingze"],
+                result["metrics"]["rhyme"],
+                semantic,
+                ", ".join(result["error_category"]) or "未发现已知失稳",
+                result["finish_reason"],
             ]
         )
     headers = ["ID", "归一化分", "覆盖率", "平仄", "押韵", "语义", "诊断", "Finish"]
     if HAS_TABULATE:
-        print(tabulate(table_data, headers=headers, tablefmt="grid"))
+        print(tabulate(rows, headers=headers, tablefmt="grid"))
     else:
-        for row in table_data:
-            print(" | ".join(str(x) for x in row))
+        for row in rows:
+            print(" | ".join(str(value) for value in row))
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        for snapshot in results:
-            f.write(json.dumps(snapshot, ensure_ascii=False) + "\n")
-    print(f"\n📁 详细结果已保存至 {output_path}")
-    print(f"📁 Bad Case 池已追加至 {badcase_path}")
-    if judge_failure_path.exists():
-        print(f"📁 裁判故障记录已追加至 {judge_failure_path}")
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run", help="指定 runs/ 下的 run 目录名")
+    parser.add_argument(
+        "--replay", action="store_true", help="明确标记本次为冻结生成集回放"
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="只运行确定性指标，不调用对仗/语义裁判",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        run_dir = resolve_run_dir(args.run)
+    except FileNotFoundError as exc:
+        print(f"[ERROR] {exc}")
+        return 2
+
+    generated_path = run_dir / "generated_results.jsonl"
+    if not generated_path.exists():
+        print(f"[ERROR] 在 {run_dir} 中找不到 generated_results.jsonl")
+        return 2
+
+    try:
+        records = load_jsonl(generated_path)
+    except (OSError, ValueError) as exc:
+        print(f"[ERROR] 读取生成快照失败：{exc}")
+        return 2
+
+    eval_dir = run_dir / "evaluations" / f"eval_{EVAL_VERSION}"
+    output_path = eval_dir / "eval_results.jsonl"
+    badcase_path = eval_dir / "badcase_pool.jsonl"
+    judge_failure_path = eval_dir / "judge_failures.jsonl"
+    metadata_path = eval_dir / "eval_metadata.json"
+
+    mode = "Replay" if args.replay else "Evaluation"
+    print(f"[INFO] [{mode}] 冻结生成快照：{generated_path}")
+    print(f"[INFO] 评测输出版本：{eval_dir}")
+    if output_path.exists():
+        print("[WARN] 当前 evaluator 版本结果已存在；成功完成后将原子替换该版本")
+
+    threshold_ratio = float(
+        os.getenv("STRUCTURE_RHYME_THRESHOLD_RATIO", "0.8")
+    )
+    min_pingze = float(os.getenv("MIN_PINGZE_FOR_SEMANTIC", "20"))
+    delay = float(os.getenv("API_DELAY_SECONDS", "0"))
+    judge_model = os.getenv("EVAL_MODEL", "unknown")
+    judge_provider = os.getenv("EVAL_PROVIDER", "unknown")
+
+    evaluator = Evaluator(
+        load_rule_config(PROJECT_ROOT / "rules" / "zhegutian_zhengti.json")
+    )
+    results: List[Dict[str, Any]] = []
+    judge_failures: List[Dict[str, Any]] = []
+
+    for index, record in enumerate(records):
+        task_id = record.get("task_id", f"record_{index}")
+        print(f"[INFO] [{index + 1}/{len(records)}] 评测 {task_id} ...")
+        snapshot, failures = evaluate_record(
+            evaluator=evaluator,
+            record=record,
+            index=index,
+            run_dir=run_dir,
+            judge_model=judge_model,
+            judge_provider=judge_provider,
+            threshold_ratio=threshold_ratio,
+            min_pingze=min_pingze,
+            enable_llm=not args.offline,
+        )
+        results.append(snapshot)
+        judge_failures.extend(failures)
+        if snapshot["llm_evaluation_triggered"] and delay > 0:
+            time.sleep(delay)
+
+    badcases = [result for result in results if result["badcase"]]
+    source_files = [
+        PROJECT_ROOT / "src" / "evaluator.py",
+        PROJECT_ROOT / "src" / "prosody.py",
+        PROJECT_ROOT / "src" / "metrics" / "pingze.py",
+        PROJECT_ROOT / "src" / "metrics" / "rhyme.py",
+        PROJECT_ROOT / "src" / "metrics" / "antithesis.py",
+        PROJECT_ROOT / "src" / "metrics" / "semantic.py",
+        PROJECT_ROOT / "data" / "zhonghua_xinyun.json",
+        PROJECT_ROOT / "rules" / "zhegutian_zhengti.json",
+    ]
+    metadata = {
+        "eval_version": EVAL_VERSION,
+        "timestamp": datetime.now().isoformat(),
+        "source_generation_snapshot": str(generated_path.relative_to(PROJECT_ROOT)),
+        "generation_snapshot_sha256": hashlib.sha256(
+            generated_path.read_bytes()
+        ).hexdigest(),
+        "evaluator_sha256": sha256_files(source_files),
+        "judge_model": judge_model,
+        "judge_provider": judge_provider,
+        "offline": args.offline,
+        "structure_rhyme_threshold_ratio": threshold_ratio,
+        "min_pingze_for_llm": min_pingze,
+        "prosody_profiles": sorted(
+            {result["prosody_profile"] for result in results}
+        ),
+        "record_count": len(results),
+        "badcase_count": len(badcases),
+        "judge_failure_count": len(judge_failures),
+    }
+
+    # 所有计算成功后才逐个原子替换；旧版本目录和历史根目录产物均不触碰。
+    atomic_write_jsonl(output_path, results)
+    atomic_write_jsonl(badcase_path, badcases)
+    atomic_write_jsonl(judge_failure_path, judge_failures)
+    atomic_write_json(metadata_path, metadata)
+
+    print_summary(results)
+    print(f"\n[OK] 评测完成：{len(results)} 条，badcase {len(badcases)} 条")
+    print(f"[INFO] 结果：{output_path}")
+    print(f"[INFO] 元数据：{metadata_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

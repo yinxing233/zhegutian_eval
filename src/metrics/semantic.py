@@ -51,10 +51,27 @@ def check_semantic(ci_text: str, prompt_context: str = "") -> Dict[str, Any]:
             "raw": result.get("raw", ""),
         }
 
+    try:
+        score = float(result["score"])
+    except (KeyError, TypeError, ValueError):
+        return {
+            "success": False,
+            "score": None,
+            "error_type": "invalid_score",
+            "raw": result.get("raw", ""),
+        }
+    if not 0.0 <= score <= 1.0:
+        return {
+            "success": False,
+            "score": None,
+            "error_type": "score_out_of_range",
+            "raw": result.get("raw", ""),
+        }
+
     # 成功
     return {
         "success": True,
-        "score": float(result.get("score", 0.0)),
+        "score": score,
         "reason": result.get("reason", ""),
         "raw": result.get("raw", json.dumps(result, ensure_ascii=False)),
     }

@@ -99,6 +99,34 @@ def get_pinyin(char: str) -> str:
     return get_pinyin_tone(char)[0]
 
 
+def get_final(char: str) -> str:
+    """返回适合现代韵书查表的规范化韵母。
+
+    pypinyin 在 ``strict=True`` 时会返回完整韵母（如 ``uei``、``iou``），
+    并用 ``v`` 表示 ``ü``。这里统一为韵书数据采用的简写形式。
+    舌尖元音（知/蚩/诗/日/资/雌/思）单独记为 ``-i``，避免与 ``齐``
+    韵中的普通 ``i`` 混淆。
+    """
+    if len(char) != 1:
+        raise ValueError("只接受单个汉字")
+
+    syllable = pinyin(char, style=Style.NORMAL, heteronym=False, strict=True)[0][0]
+    if syllable in {"zhi", "chi", "shi", "ri", "zi", "ci", "si"}:
+        return "-i"
+
+    final = pinyin(char, style=Style.FINALS, heteronym=False, strict=True)[0][0]
+    aliases = {
+        "uei": "ui",
+        "iou": "iu",
+        "uen": "un",
+        "v": "ü",
+        "ve": "üe",
+        "van": "üan",
+        "vn": "ün",
+    }
+    return aliases.get(final, final)
+
+
 def get_tone(char: str) -> int:
     """仅返回声调数字（1/2/3/4/0）"""
     return get_pinyin_tone(char)[1]

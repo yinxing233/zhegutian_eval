@@ -1,38 +1,35 @@
 """
 押韵检查模块
-基于中华新韵十八韵，检查韵脚是否同韵
+基于可版本化音韵 profile，检查韵脚是否同韵。
+MVP 默认 profile 为中华新韵十四韵（xinyun_14）。
 """
 
-import json
-from pathlib import Path
+from collections import Counter
 from typing import Any, Dict, List
 
-from utils.text_utils import get_pinyin
+from src.prosody import load_prosody_profile
+from utils.text_utils import get_final
 
 
 def load_yunbu_table(path: str = None) -> Dict[str, str]:
-    """加载韵部映射表（韵母 -> 韵部名）"""
-    if path is None:
-        path = Path(__file__).parent.parent.parent / "data" / "zhonghua_xinyun.json"
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return data["yunbu"]
+    """加载 MVP 默认的中华新韵十四韵表。
+
+    ``path`` 参数仅为旧调用兼容保留；音韵数据现在由 profile 统一管理。
+    """
+    if path is not None:
+        raise ValueError("自定义韵表路径已停用，请使用 ProsodyProfile")
+    return load_prosody_profile("xinyun_14").rhyme_groups
 
 
 def get_yunbu(char: str, yunbu_table: Dict[str, str]) -> str:
     """返回单个汉字所属韵部名，无法识别返回 '未知'"""
-    py = get_pinyin(char)
-    # 提取韵母：去掉声母，保留剩余部分
-    # 简单方法：从拼音中提取最后一个元音开始的子串
-    # 由于映射表 key 有限，我们尝试直接匹配后缀
-    for suffix in sorted(yunbu_table.keys(), key=lambda x: -len(x)):
-        if py.endswith(suffix):
-            return yunbu_table[suffix]
-    return "未知"
+    return yunbu_table.get(get_final(char), "未知")
 
 
 def check_rhyme(
-    rhyme_chars: List[str], yunbu_table: Dict[str, str] = None
+    rhyme_chars: List[str],
+    yunbu_table: Dict[str, str] = None,
+    expected_count: int = None,
 ) -> Dict[str, Any]:
     """
     检查一组韵脚字是否押韵（同属一个韵部）。
@@ -53,22 +50,36 @@ def check_rhyme(
         yunbu_table = load_yunbu_table()
 
     char_yunbu = [get_yunbu(c, yunbu_table) for c in rhyme_chars]
-    # 过滤掉“未知”
+    expected_count = expected_count if expected_count is not None else len(rhyme_chars)
     known = [y for y in char_yunbu if y != "未知"]
     if not known:
         return {
             "rhyme_ok": False,
             "yunbu_name": "无",
             "char_yunbu": char_yunbu,
+            "expected_count": expected_count,
+            "known_count": 0,
+            "dominant_yunbu": None,
+            "dominant_count": 0,
+            "unknown_chars": list(rhyme_chars),
             "detail": "无法识别任何韵脚字",
         }
 
-    first_yunbu = known[0]
-    all_same = all(y == first_yunbu for y in known)
+    counts = Counter(known)
+    dominant_yunbu, dominant_count = counts.most_common(1)[0]
+    complete = len(rhyme_chars) == expected_count and len(known) == expected_count
+    all_same = complete and dominant_count == expected_count
 
     return {
         "rhyme_ok": all_same,
-        "yunbu_name": first_yunbu if all_same else "混押",
+        "yunbu_name": dominant_yunbu if all_same else "混押或缺失",
         "char_yunbu": char_yunbu,
+        "expected_count": expected_count,
+        "known_count": len(known),
+        "dominant_yunbu": dominant_yunbu,
+        "dominant_count": dominant_count,
+        "unknown_chars": [
+            c for c, group in zip(rhyme_chars, char_yunbu) if group == "未知"
+        ],
         "detail": "全押同一韵部" if all_same else f"韵部不一致: {char_yunbu}",
     }
